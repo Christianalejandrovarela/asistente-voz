@@ -12,4 +12,6 @@ export interface VoiceChatRequest {
   audio: string;
   /** Voice to use for assistant response */
   voice?: VoiceChatRequestVoice;
+  /** BCP-47 language code for transcription hint (e.g. "es", "en", "fr"). Optional — Whisper auto-detects if omitted. */
+  language?: string;
 }

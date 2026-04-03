@@ -2,14 +2,6 @@ import { NativeModules } from "react-native";
 
 let isInitialized = false;
 
-/**
- * Sets up react-native-track-player for Bluetooth / remote control events.
- * The callbacks are invoked through a stable ref (see app/index.tsx) to avoid
- * stale-closure bugs when the assistant status changes.
- *
- * Requires a native EAS development build — gracefully returns false in Expo Go
- * where the TrackPlayer native module is absent.
- */
 export async function setupTrackPlayer(
   onPlay: () => void,
   onPause: () => void
@@ -37,7 +29,7 @@ export async function setupTrackPlayer(
 
     return true;
   } catch (err) {
-    console.log("TrackPlayer setup failed (requires native build):", err);
+    console.log("TrackPlayer setup failed:", err);
     return false;
   }
 }

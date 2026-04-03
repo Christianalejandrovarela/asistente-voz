@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef } from "react";
 import {
   FlatList,
   Platform,
@@ -16,8 +16,6 @@ import { VoiceOrb } from "@/components/VoiceOrb";
 import { MessageBubble } from "@/components/MessageBubble";
 import { AssistantStatus, ChatMessage, useAssistant } from "@/context/AssistantContext";
 import { useColors } from "@/hooks/useColors";
-import { setupTrackPlayer, destroyTrackPlayer } from "@/services/trackPlayer";
-import { startBackgroundService } from "@/services/backgroundService";
 
 const STATUS_LABELS: Record<AssistantStatus, string> = {
   idle: "Pulsa para hablar",
@@ -29,8 +27,7 @@ const STATUS_LABELS: Record<AssistantStatus, string> = {
 export default function MainScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { status, messages, startRecording, stopRecording } = useAssistant();
-  const [nativeAvailable, setNativeAvailable] = useState(false);
+  const { status, messages, isBluetoothActive, startRecording, stopRecording } = useAssistant();
   const listRef = useRef<FlatList>(null);
 
   const handleOrbPress = useCallback(async () => {
@@ -42,28 +39,6 @@ export default function MainScreen() {
       await stopRecording();
     }
   }, [status, startRecording, stopRecording]);
-
-  const handleOrbPressRef = useRef(handleOrbPress);
-  useEffect(() => {
-    handleOrbPressRef.current = handleOrbPress;
-  }, [handleOrbPress]);
-
-  useEffect(() => {
-    const init = async () => {
-      const [trackPlayerOk] = await Promise.all([
-        setupTrackPlayer(
-          () => handleOrbPressRef.current(),
-          () => handleOrbPressRef.current()
-        ),
-        startBackgroundService(),
-      ]);
-      setNativeAvailable(trackPlayerOk);
-    };
-    init();
-    return () => {
-      destroyTrackPlayer();
-    };
-  }, []);
 
   const webTopPad = Platform.OS === "web" ? 67 : 0;
   const webBotPad = Platform.OS === "web" ? 34 : 0;
@@ -89,7 +64,7 @@ export default function MainScreen() {
 
       <View style={styles.header}>
         <View style={styles.headerLeft}>
-          {nativeAvailable && (
+          {isBluetoothActive && (
             <View style={styles.btBadge}>
               <Feather name="bluetooth" size={12} color={colors.primary} />
               <Text style={[styles.btText, { color: colors.primary }]}>BT</Text>
@@ -152,9 +127,7 @@ export default function MainScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
+  container: { flex: 1 },
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -180,12 +153,8 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: "Inter_600SemiBold",
   },
-  settingsBtn: {
-    padding: 8,
-  },
-  list: {
-    flex: 1,
-  },
+  settingsBtn: { padding: 8 },
+  list: { flex: 1 },
   listContent: {
     paddingVertical: 8,
     flexGrow: 1,
@@ -216,15 +185,9 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_500Medium",
     letterSpacing: 0.3,
   },
-  orbWrapper: {
-    padding: 8,
-  },
-  orbDisabled: {
-    opacity: 0.8,
-  },
-  orbPressed: {
-    transform: [{ scale: 0.96 }],
-  },
+  orbWrapper: { padding: 8 },
+  orbDisabled: { opacity: 0.8 },
+  orbPressed: { transform: [{ scale: 0.96 }] },
   hintText: {
     fontSize: 13,
     fontFamily: "Inter_400Regular",

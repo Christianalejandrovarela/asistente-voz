@@ -27,6 +27,12 @@ export const VoiceChatBody = zod.object({
     .enum(["alloy", "echo", "fable", "onyx", "nova", "shimmer"])
     .optional()
     .describe("Voice to use for assistant response"),
+  language: zod
+    .string()
+    .optional()
+    .describe(
+      'BCP-47 language code for transcription hint (e.g. \"es\", \"en\", \"fr\"). Optional — Whisper auto-detects if omitted.',
+    ),
 });
 
 export const VoiceChatResponse = zod.object({

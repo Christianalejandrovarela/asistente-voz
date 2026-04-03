@@ -1,8 +1,5 @@
-/**
- * Web / Expo Go stub for Bluetooth headphone controls.
- * Bluetooth controls via react-native-track-player require a native EAS build.
- * This stub is loaded by Metro on the web platform instead.
- */
+// Web stub — react-native-track-player requires a native EAS build.
+// Metro automatically uses trackPlayer.native.ts on iOS/Android.
 
 export async function setupTrackPlayer(
   _onPlay: () => void,

@@ -3,9 +3,11 @@ import { Audio } from "expo-av";
 import * as FileSystem from "expo-file-system";
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 
+import { setupTrackPlayer, destroyTrackPlayer } from "@/services/trackPlayer";
+import { startBackgroundService } from "@/services/backgroundService";
+
 export type AssistantStatus = "idle" | "recording" | "processing" | "speaking";
 
-/** Shape of the /api/voice/chat response from the backend. */
 interface VoiceApiResponse {
   audio: string;
   userText: string;
@@ -50,12 +52,53 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<AssistantStatus>("idle");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [settings, setSettings] = useState<AssistantSettings>(DEFAULT_SETTINGS);
-  const [isBluetoothActive] = useState(false);
+  const [isBluetoothActive, setIsBluetoothActive] = useState(false);
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
+  const statusRef = useRef<AssistantStatus>("idle");
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
 
   useEffect(() => {
     void loadStoredData();
+  }, []);
+
+  /**
+   * Bluetooth listener setup lives at the provider level so it remains active
+   * for the full app lifetime — even when the main screen is unmounted or the
+   * app moves to the background (JS thread stays alive via the audio session
+   * and the background foreground-service).
+   *
+   * A stable ref is used so the callback always reads the latest status
+   * without re-registering listeners when status changes.
+   */
+  const handleRemoteToggleRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    handleRemoteToggleRef.current = () => {
+      const s = statusRef.current;
+      if (s === "idle") void startRecordingFn();
+      else if (s === "recording") void stopRecordingFn();
+    };
+  });
+
+  useEffect(() => {
+    const init = async () => {
+      const [btOk] = await Promise.all([
+        setupTrackPlayer(
+          () => handleRemoteToggleRef.current(),
+          () => handleRemoteToggleRef.current()
+        ),
+        startBackgroundService(),
+      ]);
+      setIsBluetoothActive(btOk);
+    };
+    void init();
+    return () => {
+      void destroyTrackPlayer();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadStoredData = async () => {
@@ -67,16 +110,14 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       if (storedMessages) setMessages(JSON.parse(storedMessages) as ChatMessage[]);
       if (storedSettings) setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(storedSettings) as Partial<AssistantSettings> });
     } catch {
-      // Silently ignore storage errors — app still functions without persisted data
+      // Silently ignore — app still functions without persisted data.
     }
   };
 
   const saveMessages = async (msgs: ChatMessage[]) => {
     try {
       await AsyncStorage.setItem(MESSAGES_KEY, JSON.stringify(msgs.slice(-50)));
-    } catch {
-      // Non-critical: history just won't persist across sessions
-    }
+    } catch {}
   };
 
   const addMessages = useCallback((newMsgs: ChatMessage[]) => {
@@ -87,8 +128,8 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  const startRecording = useCallback(async () => {
-    if (status !== "idle") return;
+  const startRecordingFn = async () => {
+    if (statusRef.current !== "idle") return;
     try {
       const { status: permStatus } = await Audio.requestPermissionsAsync();
       if (permStatus !== "granted") return;
@@ -107,10 +148,10 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       console.error("Error starting recording:", err);
       setStatus("idle");
     }
-  }, [status]);
+  };
 
-  const stopRecording = useCallback(async () => {
-    if (status !== "recording" || !recordingRef.current) return;
+  const stopRecordingFn = async () => {
+    if (statusRef.current !== "recording" || !recordingRef.current) return;
     setStatus("processing");
 
     try {
@@ -130,10 +171,15 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         ? `https://${domain}/api/voice/chat`
         : "http://localhost:8080/api/voice/chat";
 
+      const currentSettings = settings;
       const response = await fetch(apiUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audio: base64Audio, voice: settings.voice, language: settings.language }),
+        body: JSON.stringify({
+          audio: base64Audio,
+          voice: currentSettings.voice,
+          language: currentSettings.language,
+        }),
       });
 
       if (!response.ok) {
@@ -156,7 +202,17 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       console.error("Error processing voice:", err);
       setStatus("idle");
     }
-  }, [status, settings.voice, addMessages]);
+  };
+
+  const startRecording = useCallback(async () => {
+    await startRecordingFn();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const stopRecording = useCallback(async () => {
+    await stopRecordingFn();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings]);
 
   const playResponseAudio = async (base64Audio: string) => {
     try {
