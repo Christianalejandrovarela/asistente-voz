@@ -16,6 +16,11 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { AssistantProvider } from "@/context/AssistantContext";
 
+// Platform-specific side-effect import:
+// • On iOS/Android → services/initTrackPlayer.native.ts  (registers RNTP service)
+// • On web         → services/initTrackPlayer.ts          (empty stub)
+import "@/services/initTrackPlayer";
+
 SplashScreen.preventAutoHideAsync();
 
 const queryClient = new QueryClient();

@@ -33,24 +33,6 @@ export default function MainScreen() {
   const [nativeAvailable, setNativeAvailable] = useState(false);
   const listRef = useRef<FlatList>(null);
 
-  useEffect(() => {
-    initNativeFeatures();
-    return () => {
-      destroyTrackPlayer();
-    };
-  }, []);
-
-  const initNativeFeatures = async () => {
-    const [trackPlayerOk] = await Promise.all([
-      setupTrackPlayer(
-        () => handleOrbPress(),
-        () => handleOrbPress()
-      ),
-      startBackgroundService(),
-    ]);
-    setNativeAvailable(trackPlayerOk);
-  };
-
   const handleOrbPress = useCallback(async () => {
     if (status === "idle") {
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
@@ -60,6 +42,28 @@ export default function MainScreen() {
       await stopRecording();
     }
   }, [status, startRecording, stopRecording]);
+
+  const handleOrbPressRef = useRef(handleOrbPress);
+  useEffect(() => {
+    handleOrbPressRef.current = handleOrbPress;
+  }, [handleOrbPress]);
+
+  useEffect(() => {
+    const init = async () => {
+      const [trackPlayerOk] = await Promise.all([
+        setupTrackPlayer(
+          () => handleOrbPressRef.current(),
+          () => handleOrbPressRef.current()
+        ),
+        startBackgroundService(),
+      ]);
+      setNativeAvailable(trackPlayerOk);
+    };
+    init();
+    return () => {
+      destroyTrackPlayer();
+    };
+  }, []);
 
   const webTopPad = Platform.OS === "web" ? 67 : 0;
   const webBotPad = Platform.OS === "web" ? 34 : 0;

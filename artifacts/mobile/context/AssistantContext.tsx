@@ -5,6 +5,13 @@ import React, { createContext, useCallback, useContext, useEffect, useRef, useSt
 
 export type AssistantStatus = "idle" | "recording" | "processing" | "speaking";
 
+/** Shape of the /api/voice/chat response from the backend. */
+interface VoiceApiResponse {
+  audio: string;
+  userText: string;
+  assistantText: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -34,8 +41,8 @@ const SETTINGS_KEY = "@voice_assistant_settings";
 
 const DEFAULT_SETTINGS: AssistantSettings = { voice: "nova" };
 
-function generateId() {
-  return `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+function generateId(): string {
+  return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
 }
 
 export function AssistantProvider({ children }: { children: React.ReactNode }) {
@@ -47,7 +54,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const soundRef = useRef<Audio.Sound | null>(null);
 
   useEffect(() => {
-    loadStoredData();
+    void loadStoredData();
   }, []);
 
   const loadStoredData = async () => {
@@ -56,21 +63,25 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         AsyncStorage.getItem(MESSAGES_KEY),
         AsyncStorage.getItem(SETTINGS_KEY),
       ]);
-      if (storedMessages) setMessages(JSON.parse(storedMessages));
-      if (storedSettings) setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(storedSettings) });
-    } catch {}
+      if (storedMessages) setMessages(JSON.parse(storedMessages) as ChatMessage[]);
+      if (storedSettings) setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(storedSettings) as Partial<AssistantSettings> });
+    } catch {
+      // Silently ignore storage errors — app still functions without persisted data
+    }
   };
 
   const saveMessages = async (msgs: ChatMessage[]) => {
     try {
       await AsyncStorage.setItem(MESSAGES_KEY, JSON.stringify(msgs.slice(-50)));
-    } catch {}
+    } catch {
+      // Non-critical: history just won't persist across sessions
+    }
   };
 
   const addMessages = useCallback((newMsgs: ChatMessage[]) => {
     setMessages((prev) => {
       const updated = [...prev, ...newMsgs];
-      saveMessages(updated);
+      void saveMessages(updated);
       return updated;
     });
   }, []);
@@ -110,7 +121,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       if (!uri) throw new Error("No recording URI available");
 
       const base64Audio = await FileSystem.readAsStringAsync(uri, {
-        encoding: FileSystem.EncodingType.Base64,
+        encoding: "base64",
       });
 
       const domain = process.env.EXPO_PUBLIC_DOMAIN;
@@ -129,11 +140,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         throw new Error(`API error ${response.status}: ${errText}`);
       }
 
-      const data = (await response.json()) as {
-        audio: string;
-        userText: string;
-        assistantText: string;
-      };
+      const data = await response.json() as VoiceApiResponse;
 
       const now = Date.now();
       addMessages([
@@ -159,7 +166,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
       const tmpPath = `${FileSystem.cacheDirectory}ai_resp_${Date.now()}.mp3`;
       await FileSystem.writeAsStringAsync(tmpPath, base64Audio, {
-        encoding: FileSystem.EncodingType.Base64,
+        encoding: "base64",
       });
 
       await Audio.setAudioModeAsync({
@@ -175,7 +182,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         sound.setOnPlaybackStatusUpdate((playStatus) => {
           if (playStatus.isLoaded && playStatus.didJustFinish) resolve();
         });
-        sound.playAsync();
+        void sound.playAsync();
       });
 
       await sound.unloadAsync();
@@ -187,13 +194,13 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
   const clearHistory = useCallback(() => {
     setMessages([]);
-    AsyncStorage.removeItem(MESSAGES_KEY);
+    void AsyncStorage.removeItem(MESSAGES_KEY);
   }, []);
 
   const updateSettings = useCallback((newSettings: Partial<AssistantSettings>) => {
     setSettings((prev) => {
       const updated = { ...prev, ...newSettings };
-      AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(updated));
+      void AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(updated));
       return updated;
     });
   }, []);

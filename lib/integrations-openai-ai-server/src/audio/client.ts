@@ -26,6 +26,31 @@ export const openai = new OpenAI({
 export type AudioFormat = "wav" | "mp3" | "webm" | "mp4" | "ogg" | "unknown";
 
 /**
+ * Shape of the audio field in gpt-audio model responses.
+ * The OpenAI SDK types do not yet expose this field, so we declare it here.
+ */
+interface GptAudioMessageField {
+  transcript?: string;
+  data?: string;
+}
+
+/**
+ * Extended message shape returned by the gpt-audio model.
+ * `audio` holds the assistant's audio data and transcript.
+ */
+interface GptAudioMessage {
+  audio?: GptAudioMessageField;
+  content?: string | null;
+}
+
+/**
+ * Extended streaming delta shape returned by the gpt-audio model.
+ */
+interface GptAudioStreamDelta {
+  audio?: GptAudioMessageField;
+}
+
+/**
  * Detect audio format from buffer magic bytes.
  * Supports: WAV, MP3, WebM (Chrome/Firefox), MP4/M4A/MOV (Safari/iOS), OGG
  */
@@ -127,8 +152,8 @@ export async function voiceChat(
       ],
     }],
   });
-  const message = response.choices[0]?.message as any;
-  const transcript = message?.audio?.transcript || message?.content || "";
+  const message = response.choices[0]?.message as unknown as GptAudioMessage;
+  const transcript = message?.audio?.transcript ?? message?.content ?? "";
   const audioData = message?.audio?.data ?? "";
   return {
     transcript,
@@ -158,12 +183,12 @@ export async function voiceChatStream(
 
   return (async function* () {
     for await (const chunk of stream) {
-      const delta = chunk.choices?.[0]?.delta as any;
+      const delta = chunk.choices?.[0]?.delta as unknown as GptAudioStreamDelta | undefined;
       if (!delta) continue;
-      if (delta?.audio?.transcript) {
+      if (delta.audio?.transcript) {
         yield { type: "transcript", data: delta.audio.transcript };
       }
-      if (delta?.audio?.data) {
+      if (delta.audio?.data) {
         yield { type: "audio", data: delta.audio.data };
       }
     }
@@ -185,7 +210,8 @@ export async function textToSpeech(
       { role: "user", content: `Repeat the following text verbatim: ${text}` },
     ],
   });
-  const audioData = (response.choices[0]?.message as any)?.audio?.data ?? "";
+  const message = response.choices[0]?.message as unknown as GptAudioMessage;
+  const audioData = message?.audio?.data ?? "";
   return Buffer.from(audioData, "base64");
 }
 
@@ -207,9 +233,9 @@ export async function textToSpeechStream(
 
   return (async function* () {
     for await (const chunk of stream) {
-      const delta = chunk.choices?.[0]?.delta as any;
+      const delta = chunk.choices?.[0]?.delta as unknown as GptAudioStreamDelta | undefined;
       if (!delta) continue;
-      if (delta?.audio?.data) {
+      if (delta.audio?.data) {
         yield delta.audio.data;
       }
     }
