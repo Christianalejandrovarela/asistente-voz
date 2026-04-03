@@ -5,18 +5,26 @@
  * API specification
  * OpenAPI spec version: 0.1.0
  */
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import type {
+  MutationFunction,
   QueryFunction,
   QueryKey,
+  UseMutationOptions,
+  UseMutationResult,
   UseQueryOptions,
   UseQueryResult,
 } from "@tanstack/react-query";
 
-import type { HealthStatus } from "./api.schemas";
+import type {
+  HealthStatus,
+  VoiceChatRequest,
+  VoiceChatResponse,
+  VoiceError,
+} from "./api.schemas";
 
 import { customFetch } from "../custom-fetch";
-import type { ErrorType } from "../custom-fetch";
+import type { ErrorType, BodyType } from "../custom-fetch";
 
 type AwaitedInput<T> = PromiseLike<T> | T;
 
@@ -99,3 +107,90 @@ export function useHealthCheck<
 
   return { ...query, queryKey: queryOptions.queryKey };
 }
+
+/**
+ * Accepts base64-encoded audio, returns AI voice response with transcripts for both user and assistant.
+ * @summary Process audio and return AI voice response
+ */
+export const getVoiceChatUrl = () => {
+  return `/api/voice/chat`;
+};
+
+export const voiceChat = async (
+  voiceChatRequest: VoiceChatRequest,
+  options?: RequestInit,
+): Promise<VoiceChatResponse> => {
+  return customFetch<VoiceChatResponse>(getVoiceChatUrl(), {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...options?.headers },
+    body: JSON.stringify(voiceChatRequest),
+  });
+};
+
+export const getVoiceChatMutationOptions = <
+  TError = ErrorType<VoiceError>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof voiceChat>>,
+    TError,
+    { data: BodyType<VoiceChatRequest> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof voiceChat>>,
+  TError,
+  { data: BodyType<VoiceChatRequest> },
+  TContext
+> => {
+  const mutationKey = ["voiceChat"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof voiceChat>>,
+    { data: BodyType<VoiceChatRequest> }
+  > = (props) => {
+    const { data } = props ?? {};
+
+    return voiceChat(data, requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type VoiceChatMutationResult = NonNullable<
+  Awaited<ReturnType<typeof voiceChat>>
+>;
+export type VoiceChatMutationBody = BodyType<VoiceChatRequest>;
+export type VoiceChatMutationError = ErrorType<VoiceError>;
+
+/**
+ * @summary Process audio and return AI voice response
+ */
+export const useVoiceChat = <
+  TError = ErrorType<VoiceError>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof voiceChat>>,
+    TError,
+    { data: BodyType<VoiceChatRequest> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof voiceChat>>,
+  TError,
+  { data: BodyType<VoiceChatRequest> },
+  TContext
+> => {
+  return useMutation(getVoiceChatMutationOptions(options));
+};

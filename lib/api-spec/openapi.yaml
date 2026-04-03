@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: voice
+    description: AI Voice Assistant operations
 paths:
   /healthz:
     get:
@@ -24,6 +26,37 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /voice/chat:
+    post:
+      operationId: voiceChat
+      tags: [voice]
+      summary: Process audio and return AI voice response
+      description: Accepts base64-encoded audio, returns AI voice response with transcripts for both user and assistant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VoiceChatRequest"
+      responses:
+        "200":
+          description: AI voice response with audio and transcripts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoiceChatResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoiceError"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoiceError"
 components:
   schemas:
     HealthStatus:
@@ -33,4 +66,38 @@ components:
           type: string
       required:
         - status
-
+    VoiceChatRequest:
+      type: object
+      properties:
+        audio:
+          type: string
+          description: Base64-encoded audio data (M4A, WAV, MP3, WebM)
+        voice:
+          type: string
+          enum: [alloy, echo, fable, onyx, nova, shimmer]
+          description: Voice to use for assistant response
+      required:
+        - audio
+    VoiceChatResponse:
+      type: object
+      properties:
+        audio:
+          type: string
+          description: Base64-encoded MP3 audio response from assistant
+        userText:
+          type: string
+          description: Transcription of user's audio input
+        assistantText:
+          type: string
+          description: Text of assistant's response
+      required:
+        - audio
+        - userText
+        - assistantText
+    VoiceError:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error

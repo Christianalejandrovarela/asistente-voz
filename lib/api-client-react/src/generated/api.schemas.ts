@@ -8,3 +8,38 @@
 export interface HealthStatus {
   status: string;
 }
+
+/**
+ * Voice to use for assistant response
+ */
+export type VoiceChatRequestVoice =
+  (typeof VoiceChatRequestVoice)[keyof typeof VoiceChatRequestVoice];
+
+export const VoiceChatRequestVoice = {
+  alloy: "alloy",
+  echo: "echo",
+  fable: "fable",
+  onyx: "onyx",
+  nova: "nova",
+  shimmer: "shimmer",
+} as const;
+
+export interface VoiceChatRequest {
+  /** Base64-encoded audio data (M4A, WAV, MP3, WebM) */
+  audio: string;
+  /** Voice to use for assistant response */
+  voice?: VoiceChatRequestVoice;
+}
+
+export interface VoiceChatResponse {
+  /** Base64-encoded MP3 audio response from assistant */
+  audio: string;
+  /** Transcription of user's audio input */
+  userText: string;
+  /** Text of assistant's response */
+  assistantText: string;
+}
+
+export interface VoiceError {
+  error: string;
+}

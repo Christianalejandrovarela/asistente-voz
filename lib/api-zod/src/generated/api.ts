@@ -14,3 +14,25 @@ import * as zod from "zod";
 export const HealthCheckResponse = zod.object({
   status: zod.string(),
 });
+
+/**
+ * Accepts base64-encoded audio, returns AI voice response with transcripts for both user and assistant.
+ * @summary Process audio and return AI voice response
+ */
+export const VoiceChatBody = zod.object({
+  audio: zod
+    .string()
+    .describe("Base64-encoded audio data (M4A, WAV, MP3, WebM)"),
+  voice: zod
+    .enum(["alloy", "echo", "fable", "onyx", "nova", "shimmer"])
+    .optional()
+    .describe("Voice to use for assistant response"),
+});
+
+export const VoiceChatResponse = zod.object({
+  audio: zod
+    .string()
+    .describe("Base64-encoded MP3 audio response from assistant"),
+  userText: zod.string().describe("Transcription of user's audio input"),
+  assistantText: zod.string().describe("Text of assistant's response"),
+});

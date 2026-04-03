@@ -7,3 +7,7 @@
  */
 
 export * from "./healthStatus";
+export * from "./voiceChatRequest";
+export * from "./voiceChatRequestVoice";
+export * from "./voiceChatResponse";
+export * from "./voiceError";
