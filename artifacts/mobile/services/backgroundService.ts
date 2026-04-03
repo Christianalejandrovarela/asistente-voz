@@ -12,15 +12,29 @@ export async function startBackgroundService(): Promise<boolean> {
     const isRunning = await BackgroundService.isRunning();
     if (isRunning) return true;
 
-    const backgroundTask = async (taskData?: { delay?: number }) => {
-      const delay = taskData?.delay ?? 30000;
+    /**
+     * The background task must not resolve until BackgroundService.stop() is called.
+     * react-native-background-actions terminates the task when the returned promise
+     * resolves, so we use an indefinitely-pending promise that only settles when
+     * we detect the service has been stopped (checked every 10 seconds).
+     *
+     * This ensures the Android foreground service and iOS background audio session
+     * remain active for the lifetime of the user session (24/7 standby).
+     */
+    const backgroundTask = async () => {
       await new Promise<void>((resolve) => {
-        const interval = setInterval(() => {
-        }, delay);
-        setTimeout(() => {
-          clearInterval(interval);
-          resolve();
-        }, delay * 100);
+        const keepAlive = setInterval(async () => {
+          try {
+            const running = await BackgroundService.isRunning();
+            if (!running) {
+              clearInterval(keepAlive);
+              resolve();
+            }
+          } catch {
+            clearInterval(keepAlive);
+            resolve();
+          }
+        }, 10_000);
       });
     };
 
@@ -33,7 +47,6 @@ export async function startBackgroundService(): Promise<boolean> {
         type: "mipmap",
       },
       color: "#4f6ef7",
-      parameters: { delay: 30000 },
     });
 
     return true;

@@ -11,7 +11,11 @@ type VoiceParam = "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer";
 const VALID_VOICES: VoiceParam[] = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
 
 router.post("/voice/chat", async (req: Request, res: Response) => {
-  const { audio, voice = "nova" } = req.body as { audio?: string; voice?: string };
+  const { audio, voice = "nova", language } = req.body as {
+    audio?: string;
+    voice?: string;
+    language?: string;
+  };
 
   if (!audio || typeof audio !== "string") {
     res.status(400).json({ error: "audio field is required and must be a base64 string" });
@@ -30,18 +34,24 @@ router.post("/voice/chat", async (req: Request, res: Response) => {
     return;
   }
 
-  const { buffer, format } = await ensureCompatibleFormat(audioBuffer);
+  try {
+    const { buffer, format } = await ensureCompatibleFormat(audioBuffer);
 
-  const [userText, { transcript: assistantText, audioResponse }] = await Promise.all([
-    speechToText(buffer, format),
-    voiceChat(buffer, selectedVoice, format, "mp3"),
-  ]);
+    const [userText, { transcript: assistantText, audioResponse }] = await Promise.all([
+      speechToText(buffer, format, language),
+      voiceChat(buffer, selectedVoice, format, "mp3"),
+    ]);
 
-  res.json({
-    audio: audioResponse.toString("base64"),
-    userText,
-    assistantText,
-  });
+    res.json({
+      audio: audioResponse.toString("base64"),
+      userText,
+      assistantText,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Voice processing failed";
+    req.log?.error({ err }, "Voice chat processing error");
+    res.status(500).json({ error: message });
+  }
 });
 
 export default router;

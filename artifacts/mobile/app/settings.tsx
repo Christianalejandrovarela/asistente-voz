@@ -25,6 +25,21 @@ const VOICES = [
 
 type VoiceId = (typeof VOICES)[number]["id"];
 
+const LANGUAGES = [
+  { code: "es", label: "Español", flag: "🇪🇸" },
+  { code: "en", label: "English", flag: "🇺🇸" },
+  { code: "fr", label: "Français", flag: "🇫🇷" },
+  { code: "de", label: "Deutsch", flag: "🇩🇪" },
+  { code: "it", label: "Italiano", flag: "🇮🇹" },
+  { code: "pt", label: "Português", flag: "🇧🇷" },
+  { code: "zh", label: "中文", flag: "🇨🇳" },
+  { code: "ja", label: "日本語", flag: "🇯🇵" },
+  { code: "ko", label: "한국어", flag: "🇰🇷" },
+  { code: "ar", label: "العربية", flag: "🇸🇦" },
+] as const;
+
+type LanguageCode = (typeof LANGUAGES)[number]["code"];
+
 export default function SettingsScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
@@ -71,6 +86,35 @@ export default function SettingsScreen() {
       </View>
 
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+        {/* ─── Language ─── */}
+        <Text style={[styles.sectionLabel, { color: colors.mutedForeground }]}>IDIOMA</Text>
+        <View style={[styles.section, { backgroundColor: colors.card, borderColor: colors.border }]}>
+          {LANGUAGES.map((lang, idx) => {
+            const isSelected = settings.language === lang.code;
+            const isLast = idx === LANGUAGES.length - 1;
+            return (
+              <Pressable
+                key={lang.code}
+                style={[
+                  styles.optionRow,
+                  !isLast && { borderBottomColor: colors.border, borderBottomWidth: StyleSheet.hairlineWidth },
+                ]}
+                onPress={() => updateSettings({ language: lang.code as LanguageCode })}
+                testID={`lang-${lang.code}`}
+              >
+                <Text style={styles.flag}>{lang.flag}</Text>
+                <Text style={[styles.optionName, { color: colors.foreground }]}>{lang.label}</Text>
+                {isSelected && (
+                  <View style={[styles.check, { backgroundColor: colors.primary }]}>
+                    <Feather name="check" size={14} color="#fff" />
+                  </View>
+                )}
+              </Pressable>
+            );
+          })}
+        </View>
+
+        {/* ─── Voice ─── */}
         <Text style={[styles.sectionLabel, { color: colors.mutedForeground }]}>VOZ DEL ASISTENTE</Text>
         <View style={[styles.section, { backgroundColor: colors.card, borderColor: colors.border }]}>
           {VOICES.map((voice, idx) => {
@@ -80,14 +124,14 @@ export default function SettingsScreen() {
               <Pressable
                 key={voice.id}
                 style={[
-                  styles.voiceRow,
+                  styles.optionRow,
                   !isLast && { borderBottomColor: colors.border, borderBottomWidth: StyleSheet.hairlineWidth },
                 ]}
                 onPress={() => updateSettings({ voice: voice.id as VoiceId })}
                 testID={`voice-${voice.id}`}
               >
                 <View style={styles.voiceInfo}>
-                  <Text style={[styles.voiceName, { color: colors.foreground }]}>{voice.label}</Text>
+                  <Text style={[styles.optionName, { color: colors.foreground }]}>{voice.label}</Text>
                   <Text style={[styles.voiceDesc, { color: colors.mutedForeground }]}>{voice.description}</Text>
                 </View>
                 {isSelected && (
@@ -100,6 +144,7 @@ export default function SettingsScreen() {
           })}
         </View>
 
+        {/* ─── Info ─── */}
         <Text style={[styles.sectionLabel, { color: colors.mutedForeground }]}>INFORMACIÓN</Text>
         <View style={[styles.section, { backgroundColor: colors.card, borderColor: colors.border }]}>
           <View style={styles.infoRow}>
@@ -107,7 +152,7 @@ export default function SettingsScreen() {
             <View style={styles.infoText}>
               <Text style={[styles.infoTitle, { color: colors.foreground }]}>Control Bluetooth</Text>
               <Text style={[styles.infoDesc, { color: colors.mutedForeground }]}>
-                Pulsa play/pausa en tus auriculares para activar el micrófono. Requiere build nativo.
+                Pulsa play/pausa en tus auriculares para activar el micrófono. Requiere build nativo con EAS.
               </Text>
             </View>
           </View>
@@ -117,12 +162,13 @@ export default function SettingsScreen() {
             <View style={styles.infoText}>
               <Text style={[styles.infoTitle, { color: colors.foreground }]}>Servicio en segundo plano</Text>
               <Text style={[styles.infoDesc, { color: colors.mutedForeground }]}>
-                La app permanece activa 24/7. Requiere build nativo.
+                La app permanece activa 24/7 con notificación persistente. Requiere build nativo con EAS.
               </Text>
             </View>
           </View>
         </View>
 
+        {/* ─── Conversation ─── */}
         <Text style={[styles.sectionLabel, { color: colors.mutedForeground }]}>CONVERSACIÓN</Text>
         <View style={[styles.section, { backgroundColor: colors.card, borderColor: colors.border }]}>
           <Pressable style={styles.dangerRow} onPress={handleClearHistory} testID="clear-history">
@@ -178,17 +224,20 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     overflow: "hidden",
   },
-  voiceRow: {
+  optionRow: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 16,
     paddingVertical: 14,
     gap: 12,
   },
+  flag: {
+    fontSize: 22,
+  },
   voiceInfo: {
     flex: 1,
   },
-  voiceName: {
+  optionName: {
     fontSize: 16,
     fontFamily: "Inter_500Medium",
     marginBottom: 2,

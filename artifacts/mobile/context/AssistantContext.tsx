@@ -21,6 +21,7 @@ export interface ChatMessage {
 
 export interface AssistantSettings {
   voice: "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer";
+  language: string;
 }
 
 interface AssistantContextValue {
@@ -39,7 +40,7 @@ const AssistantContext = createContext<AssistantContextValue | null>(null);
 const MESSAGES_KEY = "@voice_assistant_messages";
 const SETTINGS_KEY = "@voice_assistant_settings";
 
-const DEFAULT_SETTINGS: AssistantSettings = { voice: "nova" };
+const DEFAULT_SETTINGS: AssistantSettings = { voice: "nova", language: "es" };
 
 function generateId(): string {
   return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
@@ -132,7 +133,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       const response = await fetch(apiUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audio: base64Audio, voice: settings.voice }),
+        body: JSON.stringify({ audio: base64Audio, voice: settings.voice, language: settings.language }),
       });
 
       if (!response.ok) {

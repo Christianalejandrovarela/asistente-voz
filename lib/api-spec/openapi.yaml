@@ -76,6 +76,9 @@ components:
           type: string
           enum: [alloy, echo, fable, onyx, nova, shimmer]
           description: Voice to use for assistant response
+        language:
+          type: string
+          description: BCP-47 language code for transcription hint (e.g. "es", "en", "fr"). Optional — Whisper auto-detects if omitted.
       required:
         - audio
     VoiceChatResponse:
