@@ -24,8 +24,15 @@ export async function setupTrackPlayer(
       isInitialized = true;
     }
 
+    // Discrete play/pause events (most headsets with separate buttons)
     TrackPlayer.addEventListener(Event.RemotePlay, () => onPlay());
     TrackPlayer.addEventListener(Event.RemotePause, () => onPause());
+
+    // Toggle-style play/pause (single-button headsets; most common on iOS)
+    TrackPlayer.addEventListener(Event.RemotePlayPause, () => {
+      // onPlay acts as a toggle at the context level (sees current status via ref)
+      onPlay();
+    });
 
     return true;
   } catch (err) {

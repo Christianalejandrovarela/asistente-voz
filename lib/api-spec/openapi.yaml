@@ -26,12 +26,47 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /voice/transcribe:
+    post:
+      operationId: voiceTranscribe
+      tags: [voice]
+      summary: Transcribe audio to text
+      description: Uses Whisper (gpt-4o-mini-transcribe) to convert base64-encoded audio into text.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VoiceTranscribeRequest"
+      responses:
+        "200":
+          description: Transcription result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoiceTranscribeResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoiceError"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoiceError"
   /voice/chat:
     post:
       operationId: voiceChat
       tags: [voice]
-      summary: Process audio and return AI voice response
-      description: Accepts base64-encoded audio, returns AI voice response with transcripts for both user and assistant.
+      summary: Full speech-to-speech AI conversation turn
+      description: |
+        Runs a full voice conversation turn in parallel:
+        1. Whisper (gpt-4o-mini-transcribe) → user transcript
+        2. gpt-4o-audio-preview → assistant response text + MP3 audio
+        Returns both transcripts and the base64-encoded MP3.
       requestBody:
         required: true
         content:
@@ -66,6 +101,25 @@ components:
           type: string
       required:
         - status
+    VoiceTranscribeRequest:
+      type: object
+      properties:
+        audio:
+          type: string
+          description: Base64-encoded audio data (M4A, WAV, MP3, WebM)
+        language:
+          type: string
+          description: BCP-47 language code hint for Whisper (e.g. "es", "en"). Optional — auto-detects if omitted.
+      required:
+        - audio
+    VoiceTranscribeResponse:
+      type: object
+      properties:
+        text:
+          type: string
+          description: Transcribed text from user audio
+      required:
+        - text
     VoiceChatRequest:
       type: object
       properties:
@@ -75,10 +129,10 @@ components:
         voice:
           type: string
           enum: [alloy, echo, fable, onyx, nova, shimmer]
-          description: Voice to use for assistant response
+          description: gpt-4o-audio-preview voice for assistant response
         language:
           type: string
-          description: BCP-47 language code for transcription hint (e.g. "es", "en", "fr"). Optional — Whisper auto-detects if omitted.
+          description: BCP-47 language code hint for Whisper transcription (e.g. "es", "en", "fr"). Optional.
       required:
         - audio
     VoiceChatResponse:
@@ -86,13 +140,13 @@ components:
       properties:
         audio:
           type: string
-          description: Base64-encoded MP3 audio response from assistant
+          description: Base64-encoded MP3 audio response from gpt-4o-audio-preview
         userText:
           type: string
-          description: Transcription of user's audio input
+          description: Whisper transcription of user's audio input
         assistantText:
           type: string
-          description: Text of assistant's response
+          description: Text of the gpt-4o-audio-preview assistant response
       required:
         - audio
         - userText

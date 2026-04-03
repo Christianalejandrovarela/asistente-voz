@@ -11,3 +11,5 @@ export * from "./voiceChatRequest";
 export * from "./voiceChatRequestVoice";
 export * from "./voiceChatResponse";
 export * from "./voiceError";
+export * from "./voiceTranscribeRequest";
+export * from "./voiceTranscribeResponse";

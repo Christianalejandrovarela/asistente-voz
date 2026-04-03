@@ -21,6 +21,8 @@ import type {
   VoiceChatRequest,
   VoiceChatResponse,
   VoiceError,
+  VoiceTranscribeRequest,
+  VoiceTranscribeResponse,
 } from "./api.schemas";
 
 import { customFetch } from "../custom-fetch";
@@ -109,8 +111,99 @@ export function useHealthCheck<
 }
 
 /**
- * Accepts base64-encoded audio, returns AI voice response with transcripts for both user and assistant.
- * @summary Process audio and return AI voice response
+ * Uses Whisper (gpt-4o-mini-transcribe) to convert base64-encoded audio into text.
+ * @summary Transcribe audio to text
+ */
+export const getVoiceTranscribeUrl = () => {
+  return `/api/voice/transcribe`;
+};
+
+export const voiceTranscribe = async (
+  voiceTranscribeRequest: VoiceTranscribeRequest,
+  options?: RequestInit,
+): Promise<VoiceTranscribeResponse> => {
+  return customFetch<VoiceTranscribeResponse>(getVoiceTranscribeUrl(), {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...options?.headers },
+    body: JSON.stringify(voiceTranscribeRequest),
+  });
+};
+
+export const getVoiceTranscribeMutationOptions = <
+  TError = ErrorType<VoiceError>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof voiceTranscribe>>,
+    TError,
+    { data: BodyType<VoiceTranscribeRequest> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof voiceTranscribe>>,
+  TError,
+  { data: BodyType<VoiceTranscribeRequest> },
+  TContext
+> => {
+  const mutationKey = ["voiceTranscribe"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof voiceTranscribe>>,
+    { data: BodyType<VoiceTranscribeRequest> }
+  > = (props) => {
+    const { data } = props ?? {};
+
+    return voiceTranscribe(data, requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type VoiceTranscribeMutationResult = NonNullable<
+  Awaited<ReturnType<typeof voiceTranscribe>>
+>;
+export type VoiceTranscribeMutationBody = BodyType<VoiceTranscribeRequest>;
+export type VoiceTranscribeMutationError = ErrorType<VoiceError>;
+
+/**
+ * @summary Transcribe audio to text
+ */
+export const useVoiceTranscribe = <
+  TError = ErrorType<VoiceError>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof voiceTranscribe>>,
+    TError,
+    { data: BodyType<VoiceTranscribeRequest> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof voiceTranscribe>>,
+  TError,
+  { data: BodyType<VoiceTranscribeRequest> },
+  TContext
+> => {
+  return useMutation(getVoiceTranscribeMutationOptions(options));
+};
+
+/**
+ * Runs a full voice conversation turn in parallel:
+1. Whisper (gpt-4o-mini-transcribe) → user transcript
+2. gpt-4o-audio-preview → assistant response text + MP3 audio
+Returns both transcripts and the base64-encoded MP3.
+
+ * @summary Full speech-to-speech AI conversation turn
  */
 export const getVoiceChatUrl = () => {
   return `/api/voice/chat`;
@@ -173,7 +266,7 @@ export type VoiceChatMutationBody = BodyType<VoiceChatRequest>;
 export type VoiceChatMutationError = ErrorType<VoiceError>;
 
 /**
- * @summary Process audio and return AI voice response
+ * @summary Full speech-to-speech AI conversation turn
  */
 export const useVoiceChat = <
   TError = ErrorType<VoiceError>,

@@ -7,10 +7,10 @@
  */
 
 export interface VoiceChatResponse {
-  /** Base64-encoded MP3 audio response from assistant */
+  /** Base64-encoded MP3 audio response from gpt-4o-audio-preview */
   audio: string;
-  /** Transcription of user's audio input */
+  /** Whisper transcription of user's audio input */
   userText: string;
-  /** Text of assistant's response */
+  /** Text of the gpt-4o-audio-preview assistant response */
   assistantText: string;
 }

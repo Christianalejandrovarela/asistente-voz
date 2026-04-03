@@ -7,7 +7,7 @@
  */
 
 /**
- * Voice to use for assistant response
+ * gpt-4o-audio-preview voice for assistant response
  */
 export type VoiceChatRequestVoice =
   (typeof VoiceChatRequestVoice)[keyof typeof VoiceChatRequestVoice];

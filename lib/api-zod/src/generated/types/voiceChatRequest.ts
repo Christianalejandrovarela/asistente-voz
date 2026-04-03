@@ -10,8 +10,8 @@ import type { VoiceChatRequestVoice } from "./voiceChatRequestVoice";
 export interface VoiceChatRequest {
   /** Base64-encoded audio data (M4A, WAV, MP3, WebM) */
   audio: string;
-  /** Voice to use for assistant response */
+  /** gpt-4o-audio-preview voice for assistant response */
   voice?: VoiceChatRequestVoice;
-  /** BCP-47 language code for transcription hint (e.g. "es", "en", "fr"). Optional — Whisper auto-detects if omitted. */
+  /** BCP-47 language code hint for Whisper transcription (e.g. "es", "en", "fr"). Optional. */
   language?: string;
 }

@@ -16,8 +16,32 @@ export const HealthCheckResponse = zod.object({
 });
 
 /**
- * Accepts base64-encoded audio, returns AI voice response with transcripts for both user and assistant.
- * @summary Process audio and return AI voice response
+ * Uses Whisper (gpt-4o-mini-transcribe) to convert base64-encoded audio into text.
+ * @summary Transcribe audio to text
+ */
+export const VoiceTranscribeBody = zod.object({
+  audio: zod
+    .string()
+    .describe("Base64-encoded audio data (M4A, WAV, MP3, WebM)"),
+  language: zod
+    .string()
+    .optional()
+    .describe(
+      'BCP-47 language code hint for Whisper (e.g. \"es\", \"en\"). Optional — auto-detects if omitted.',
+    ),
+});
+
+export const VoiceTranscribeResponse = zod.object({
+  text: zod.string().describe("Transcribed text from user audio"),
+});
+
+/**
+ * Runs a full voice conversation turn in parallel:
+1. Whisper (gpt-4o-mini-transcribe) → user transcript
+2. gpt-4o-audio-preview → assistant response text + MP3 audio
+Returns both transcripts and the base64-encoded MP3.
+
+ * @summary Full speech-to-speech AI conversation turn
  */
 export const VoiceChatBody = zod.object({
   audio: zod
@@ -26,19 +50,23 @@ export const VoiceChatBody = zod.object({
   voice: zod
     .enum(["alloy", "echo", "fable", "onyx", "nova", "shimmer"])
     .optional()
-    .describe("Voice to use for assistant response"),
+    .describe("gpt-4o-audio-preview voice for assistant response"),
   language: zod
     .string()
     .optional()
     .describe(
-      'BCP-47 language code for transcription hint (e.g. \"es\", \"en\", \"fr\"). Optional — Whisper auto-detects if omitted.',
+      'BCP-47 language code hint for Whisper transcription (e.g. \"es\", \"en\", \"fr\"). Optional.',
     ),
 });
 
 export const VoiceChatResponse = zod.object({
   audio: zod
     .string()
-    .describe("Base64-encoded MP3 audio response from assistant"),
-  userText: zod.string().describe("Transcription of user's audio input"),
-  assistantText: zod.string().describe("Text of assistant's response"),
+    .describe("Base64-encoded MP3 audio response from gpt-4o-audio-preview"),
+  userText: zod
+    .string()
+    .describe("Whisper transcription of user's audio input"),
+  assistantText: zod
+    .string()
+    .describe("Text of the gpt-4o-audio-preview assistant response"),
 });

@@ -9,8 +9,20 @@ export interface HealthStatus {
   status: string;
 }
 
+export interface VoiceTranscribeRequest {
+  /** Base64-encoded audio data (M4A, WAV, MP3, WebM) */
+  audio: string;
+  /** BCP-47 language code hint for Whisper (e.g. "es", "en"). Optional — auto-detects if omitted. */
+  language?: string;
+}
+
+export interface VoiceTranscribeResponse {
+  /** Transcribed text from user audio */
+  text: string;
+}
+
 /**
- * Voice to use for assistant response
+ * gpt-4o-audio-preview voice for assistant response
  */
 export type VoiceChatRequestVoice =
   (typeof VoiceChatRequestVoice)[keyof typeof VoiceChatRequestVoice];
@@ -27,18 +39,18 @@ export const VoiceChatRequestVoice = {
 export interface VoiceChatRequest {
   /** Base64-encoded audio data (M4A, WAV, MP3, WebM) */
   audio: string;
-  /** Voice to use for assistant response */
+  /** gpt-4o-audio-preview voice for assistant response */
   voice?: VoiceChatRequestVoice;
-  /** BCP-47 language code for transcription hint (e.g. "es", "en", "fr"). Optional — Whisper auto-detects if omitted. */
+  /** BCP-47 language code hint for Whisper transcription (e.g. "es", "en", "fr"). Optional. */
   language?: string;
 }
 
 export interface VoiceChatResponse {
-  /** Base64-encoded MP3 audio response from assistant */
+  /** Base64-encoded MP3 audio response from gpt-4o-audio-preview */
   audio: string;
-  /** Transcription of user's audio input */
+  /** Whisper transcription of user's audio input */
   userText: string;
-  /** Text of assistant's response */
+  /** Text of the gpt-4o-audio-preview assistant response */
   assistantText: string;
 }
 
