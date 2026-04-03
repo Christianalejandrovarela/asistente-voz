@@ -24,15 +24,11 @@ export async function setupTrackPlayer(
       isInitialized = true;
     }
 
-    // Discrete play/pause events (most headsets with separate buttons)
+    // Both onPlay and onPause call the same context-level toggle (reads current
+    // statusRef at call time), so any headset button correctly toggles recording
+    // regardless of whether the OS sends RemotePlay or RemotePause.
     TrackPlayer.addEventListener(Event.RemotePlay, () => onPlay());
     TrackPlayer.addEventListener(Event.RemotePause, () => onPause());
-
-    // Toggle-style play/pause (single-button headsets; most common on iOS)
-    TrackPlayer.addEventListener(Event.RemotePlayPause, () => {
-      // onPlay acts as a toggle at the context level (sees current status via ref)
-      onPlay();
-    });
 
     return true;
   } catch (err) {
