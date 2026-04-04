@@ -27,7 +27,7 @@ const STATUS_LABELS: Record<AssistantStatus, string> = {
 export default function MainScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { status, messages, isBluetoothActive, startRecording, stopRecording } = useAssistant();
+  const { status, messages, isBluetoothActive, debugInfo, startRecording, stopRecording } = useAssistant();
   const listRef = useRef<FlatList>(null);
 
   const handleOrbPress = useCallback(async () => {
@@ -122,6 +122,12 @@ export default function MainScreen() {
           {status === "recording" ? "Toca para enviar" : " "}
         </Text>
       </View>
+
+      {Platform.OS !== "web" && (
+        <View style={styles.debugBar}>
+          <Text style={styles.debugText}>{debugInfo}</Text>
+        </View>
+      )}
     </View>
   );
 }
@@ -192,5 +198,16 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontFamily: "Inter_400Regular",
     height: 18,
+  },
+  debugBar: {
+    backgroundColor: "rgba(0,0,0,0.7)",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  debugText: {
+    color: "#aaa",
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
+    textAlign: "center",
   },
 });

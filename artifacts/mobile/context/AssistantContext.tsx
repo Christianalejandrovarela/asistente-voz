@@ -4,10 +4,11 @@ import * as FileSystem from "expo-file-system/legacy";
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Alert, Platform } from "react-native";
 
-import { setupTrackPlayer, destroyTrackPlayer } from "@/services/trackPlayer";
-import { startBackgroundService } from "@/services/backgroundService";
-import { initDb, getMessages, addMessage, clearMessages } from "@/services/conversationDb";
-import { RollingBufferManager, type BufferSegment } from "@/services/rollingBufferManager";
+import { setupTrackPlayer, destroyTrackPlayer, pauseSilentTrack, resumeSilentTrack } from "@/services/trackPlayer";
+import { startBackgroundService, stopBackgroundService } from "@/services/backgroundService";
+import { initDb, getMessages, addMessage, clearMessages, startAutoPurge, stopAutoPurge, purgeOldMessages } from "@/services/conversationDb";
+import { RollingBufferManager } from "@/services/rollingBufferManager";
+import { onBluetoothDisconnect } from "@/services/bluetoothAudio";
 
 export type AssistantStatus = "idle" | "recording" | "processing" | "speaking";
 
@@ -31,7 +32,7 @@ export interface AssistantSettings {
 
 interface RollingBufferContext {
   isActive: boolean;
-  getSegments: () => BufferSegment[];
+  getContextText: () => string;
 }
 
 interface AssistantContextValue {
@@ -40,6 +41,7 @@ interface AssistantContextValue {
   settings: AssistantSettings;
   isBluetoothActive: boolean;
   rollingBuffer: RollingBufferContext;
+  debugInfo: string;
   startRecording: () => Promise<void>;
   stopRecording: () => Promise<void>;
   clearHistory: () => void;
@@ -58,11 +60,6 @@ function generateId(): string {
   return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
 }
 
-/**
- * Converts a recording URI to base64.
- * • On web, expo-av returns a blob: URL — we use fetch + FileReader.
- * • On native, it returns a file:// path — expo-file-system handles it.
- */
 async function readUriAsBase64(uri: string): Promise<string> {
   if (Platform.OS === "web" || uri.startsWith("blob:")) {
     const resp = await fetch(uri);
@@ -86,6 +83,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const [settings, setSettings] = useState<AssistantSettings>(DEFAULT_SETTINGS);
   const [isBluetoothActive, setIsBluetoothActive] = useState(false);
   const [isRollingBufferActive, setIsRollingBufferActive] = useState(false);
+  const [debugInfo, setDebugInfo] = useState("Iniciando...");
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
   const statusRef = useRef<AssistantStatus>("idle");
@@ -98,15 +96,6 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     void loadStoredData();
   }, []);
 
-  /**
-   * Bluetooth listener setup lives at the provider level so it remains active
-   * for the full app lifetime — even when the main screen is unmounted or the
-   * app moves to the background (JS thread stays alive via the audio session
-   * and the background foreground-service).
-   *
-   * A stable ref is used so the callback always reads the latest status
-   * without re-registering listeners when status changes.
-   */
   const handleRemoteToggleRef = useRef<() => void>(() => {});
   useEffect(() => {
     handleRemoteToggleRef.current = () => {
@@ -117,45 +106,90 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   });
 
   useEffect(() => {
+    let btCleanup: (() => void) | null = null;
+
     const init = async () => {
-      const [btOk] = await Promise.all([
-        setupTrackPlayer(
-          () => handleRemoteToggleRef.current(),
-          () => handleRemoteToggleRef.current()
-        ),
-        startBackgroundService(),
-      ]);
+      setDebugInfo("Configurando TrackPlayer...");
+      let btOk = false;
+      try {
+        const [tpResult] = await Promise.all([
+          setupTrackPlayer(
+            () => {
+              console.log("[AssistantContext] RemotePlay → toggle, status:", statusRef.current);
+              setDebugInfo(`RemotePlay! status=${statusRef.current}`);
+              handleRemoteToggleRef.current();
+            },
+            () => {
+              console.log("[AssistantContext] RemotePause → toggle, status:", statusRef.current);
+              setDebugInfo(`RemotePause! status=${statusRef.current}`);
+              handleRemoteToggleRef.current();
+            }
+          ),
+          startBackgroundService(),
+        ]);
+        btOk = tpResult;
+        setDebugInfo(btOk ? "TrackPlayer OK - pista reproduciendo" : "TrackPlayer NO disponible");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setDebugInfo(`Error TrackPlayer: ${msg}`);
+        console.log("[AssistantContext] TrackPlayer error:", err);
+      }
       setIsBluetoothActive(btOk);
+      console.log("[AssistantContext] TrackPlayer initialized:", btOk);
+
+      if (btOk) {
+        const bufferStarted = await RollingBufferManager.start();
+        if (bufferStarted) {
+          setIsRollingBufferActive(true);
+          await AsyncStorage.setItem(ROLLING_BUFFER_KEY, "true");
+        }
+
+        btCleanup = onBluetoothDisconnect(() => {
+          void handleBluetoothDisconnect();
+        });
+      }
     };
     void init();
     return () => {
+      if (btCleanup) btCleanup();
       void destroyTrackPlayer();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    startAutoPurge();
+    const memoryPurge = setInterval(() => {
+      const cutoff = Date.now() - 10 * 60 * 1000;
+      setMessages((prev) => prev.filter((m) => m.timestamp >= cutoff));
+    }, 60_000);
+    return () => {
+      stopAutoPurge();
+      clearInterval(memoryPurge);
+    };
+  }, []);
+
+  const handleBluetoothDisconnect = async () => {
+    console.log("[VoiceAssistant] Bluetooth disconnected, stopping services");
+    await RollingBufferManager.stop();
+    setIsRollingBufferActive(false);
+    await AsyncStorage.setItem(ROLLING_BUFFER_KEY, "false");
+    await stopBackgroundService();
+    setIsBluetoothActive(false);
+  };
+
   const loadStoredData = async () => {
     try {
       await initDb();
-      const [storedMsgs, storedSettings, storedBuffer] = await Promise.all([
+      const [storedMsgs, storedSettings] = await Promise.all([
         getMessages(200),
         AsyncStorage.getItem(SETTINGS_KEY),
-        AsyncStorage.getItem(ROLLING_BUFFER_KEY),
       ]);
       setMessages(storedMsgs);
       if (storedSettings) {
         setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(storedSettings) as Partial<AssistantSettings> });
       }
-      if (storedBuffer === "true") {
-        const started = await RollingBufferManager.start();
-        if (started) {
-          setIsRollingBufferActive(true);
-        } else {
-          await AsyncStorage.setItem(ROLLING_BUFFER_KEY, "false");
-        }
-      }
-    } catch {
-    }
+    } catch {}
   };
 
   const addMessages = useCallback((newMsgs: ChatMessage[]) => {
@@ -178,6 +212,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       }
 
       await RollingBufferManager.pause();
+      await pauseSilentTrack();
 
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
@@ -193,6 +228,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       console.error("[VoiceAssistant] Error starting recording:", err);
       setStatus("idle");
       await RollingBufferManager.resume();
+      await resumeSilentTrack();
     }
   };
 
@@ -215,9 +251,24 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         ? `https://${domain}/api/voice/chat`
         : "http://localhost:8080/api/voice/chat";
 
+      await purgeOldMessages();
       const currentSettings = settings;
       const recentHistory = await getMessages(20);
-      const historyPayload = recentHistory.map((m) => ({ role: m.role, text: m.text }));
+
+      const contextText = RollingBufferManager.getContextText();
+
+      const historyPayload: { role: string; text: string }[] = [];
+      if (contextText.length > 0) {
+        historyPayload.push({
+          role: "user",
+          text: `[Contexto de los últimos minutos de conversación ambiental]: ${contextText}`,
+        });
+      }
+      for (const m of recentHistory) {
+        if (!m.text.startsWith("[contexto]")) {
+          historyPayload.push({ role: m.role, text: m.text });
+        }
+      }
 
       const response = await fetch(apiUrl, {
         method: "POST",
@@ -226,7 +277,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
           audio: base64Audio,
           voice: currentSettings.voice,
           language: currentSettings.language,
-          history: historyPayload,
+          history: historyPayload.slice(-20),
         }),
       });
 
@@ -247,12 +298,14 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       await playResponseAudio(data.audio);
       setStatus("idle");
       await RollingBufferManager.resume();
+      await resumeSilentTrack();
     } catch (err) {
       console.error("[VoiceAssistant] Error processing voice:", err);
       const message = err instanceof Error ? err.message : "Error desconocido";
       Alert.alert("Error de voz", `No se pudo procesar el audio: ${message}`, [{ text: "OK" }]);
       setStatus("idle");
       await RollingBufferManager.resume();
+      await resumeSilentTrack();
     }
   };
 
@@ -268,22 +321,18 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
   const playResponseAudio = async (base64Audio: string) => {
     try {
-      // Unload any previous sound first
       if (soundRef.current) {
         try { await soundRef.current.stopAsync(); } catch {}
         try { await soundRef.current.unloadAsync(); } catch {}
         soundRef.current = null;
       }
 
-      // Use a fixed filename so we always overwrite — avoids accumulating
-      // temp files in the cache directory on Android.
       const tmpPath = `${FileSystem.cacheDirectory ?? ""}ai_response.mp3`;
 
       await FileSystem.writeAsStringAsync(tmpPath, base64Audio, {
         encoding: "base64",
       });
 
-      // Switch audio session back to playback mode (critical after recording)
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: false,
         playsInSilentModeIOS: true,
@@ -298,7 +347,6 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       );
       soundRef.current = sound;
 
-      // Wait for playback to finish
       await new Promise<void>((resolve) => {
         sound.setOnPlaybackStatusUpdate((playStatus) => {
           if (playStatus.isLoaded && (playStatus.didJustFinish || !playStatus.isPlaying && playStatus.positionMillis > 0 && playStatus.durationMillis && playStatus.positionMillis >= playStatus.durationMillis)) {
@@ -350,7 +398,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
   const rollingBuffer: RollingBufferContext = {
     isActive: isRollingBufferActive,
-    getSegments: () => RollingBufferManager.getSegments(),
+    getContextText: () => RollingBufferManager.getContextText(),
   };
 
   return (
@@ -361,6 +409,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         settings,
         isBluetoothActive,
         rollingBuffer,
+        debugInfo,
         startRecording,
         stopRecording,
         clearHistory,

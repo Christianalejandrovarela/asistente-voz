@@ -1,21 +1,9 @@
-// Resolve @expo/config-plugins with fallback — works in monorepo (via root
-// node_modules) and in EAS cloud (where expo re-exports config-plugins).
 const { withAndroidManifest, withInfoPlist } = (() => {
   try { return require("@expo/config-plugins"); } catch (_) {}
   try { return require("expo/config-plugins"); } catch (_) {}
   throw new Error("Cannot resolve @expo/config-plugins. Add it as a devDependency.");
 })();
 
-/**
- * Expo config plugin for react-native-track-player.
- *
- * Configures:
- * - iOS: Ensures "audio" is in UIBackgroundModes for background audio playback
- *   (also handled by expo-av; this plugin makes the intent explicit).
- * - Android: Declares the KotlinAudioEngine foreground service with
- *   `android:foregroundServiceType="mediaPlayback"`, required for Android 10+
- *   to show the media notification and allow background playback.
- */
 function withReactNativeTrackPlayer(config) {
   config = withInfoPlist(config, (cfg) => {
     const modes = cfg.modResults.UIBackgroundModes ?? [];
@@ -32,20 +20,30 @@ function withReactNativeTrackPlayer(config) {
 
     if (!application.service) application.service = [];
 
-    const RNTP_SERVICE = "com.doublesymmetry.kotlinaudio.service.KotlinAudioEngine";
-    const already = application.service.some(
-      (s) => s.$?.["android:name"] === RNTP_SERVICE
-    );
+    const RNTP_SERVICE = "com.doublesymmetry.trackplayer.service.MusicService";
+    const BG_ACTIONS_SERVICE = "com.asterinet.react.bgactions.RNBackgroundActionsTask";
+    const COMBINED_FG_TYPE = "mediaPlayback|microphone";
 
-    if (!already) {
-      application.service.push({
+    const findAndUpsert = (name, fgType) => {
+      const idx = application.service.findIndex(
+        (s) => s.$?.["android:name"] === name
+      );
+      const entry = {
         $: {
-          "android:name": RNTP_SERVICE,
-          "android:exported": "false",
-          "android:foregroundServiceType": "mediaPlayback",
+          "android:name": name,
+          "android:exported": "true",
+          "android:foregroundServiceType": fgType,
         },
-      });
-    }
+      };
+      if (idx >= 0) {
+        application.service[idx] = entry;
+      } else {
+        application.service.push(entry);
+      }
+    };
+
+    findAndUpsert(RNTP_SERVICE, COMBINED_FG_TYPE);
+    findAndUpsert(BG_ACTIONS_SERVICE, COMBINED_FG_TYPE);
 
     return cfg;
   });

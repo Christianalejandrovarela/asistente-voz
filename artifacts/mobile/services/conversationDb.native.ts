@@ -2,6 +2,8 @@ import * as SQLite from "expo-sqlite";
 
 import type { ChatMessage } from "@/context/AssistantContext";
 
+const BUFFER_WINDOW_MS = 10 * 60 * 1000;
+
 let db: SQLite.SQLiteDatabase | null = null;
 
 async function getDb(): Promise<SQLite.SQLiteDatabase> {
@@ -22,9 +24,11 @@ export async function initDb(): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
   `);
+  await purgeOldMessages();
 }
 
 export async function getMessages(limit = 50): Promise<ChatMessage[]> {
+  await purgeOldMessages();
   const database = await getDb();
   const rows = await database.getAllAsync<ChatMessage>(
     "SELECT id, role, text, timestamp FROM messages ORDER BY timestamp DESC LIMIT ?",
@@ -44,4 +48,30 @@ export async function addMessage(message: ChatMessage): Promise<void> {
 export async function clearMessages(): Promise<void> {
   const database = await getDb();
   await database.runAsync("DELETE FROM messages");
+}
+
+export async function purgeOldMessages(): Promise<number> {
+  const database = await getDb();
+  const cutoff = Date.now() - BUFFER_WINDOW_MS;
+  const result = await database.runAsync(
+    "DELETE FROM messages WHERE timestamp < ?",
+    [cutoff]
+  );
+  return result.changes;
+}
+
+let purgeInterval: ReturnType<typeof setInterval> | null = null;
+
+export function startAutoPurge(): void {
+  if (purgeInterval) return;
+  purgeInterval = setInterval(() => {
+    void purgeOldMessages();
+  }, 60_000);
+}
+
+export function stopAutoPurge(): void {
+  if (purgeInterval) {
+    clearInterval(purgeInterval);
+    purgeInterval = null;
+  }
 }
