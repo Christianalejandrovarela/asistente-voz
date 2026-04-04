@@ -445,6 +445,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   };
 
   const playResponseAudio = async (base64Audio: string) => {
+    let tmpPath = "";
     try {
       if (soundRef.current) {
         try { await soundRef.current.stopAsync(); } catch {}
@@ -452,7 +453,8 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         soundRef.current = null;
       }
 
-      const tmpPath = `${FileSystem.cacheDirectory ?? ""}ai_response.mp3`;
+      // Unique filename avoids stale file conflicts between calls
+      tmpPath = `${FileSystem.cacheDirectory ?? ""}ai_resp_${Date.now()}.mp3`;
       await FileSystem.writeAsStringAsync(tmpPath, base64Audio, { encoding: "base64" });
 
       await Audio.setAudioModeAsync({
@@ -463,32 +465,44 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         playThroughEarpieceAndroid: false,
       });
 
+      // Register the callback BEFORE playback starts by passing it as the 3rd
+      // argument to createAsync. This prevents the race condition where
+      // didJustFinish fires before setOnPlaybackStatusUpdate is called.
+      let resolvePlayback!: () => void;
+      const playbackDone = new Promise<void>((res) => { resolvePlayback = res; });
+
       const { sound } = await Audio.Sound.createAsync(
         { uri: tmpPath },
-        { shouldPlay: true, volume: 1.0 }
+        { shouldPlay: true, volume: 1.0 },
+        (ps) => {
+          if (!ps.isLoaded) return;
+          if (
+            ps.didJustFinish ||
+            (!ps.isPlaying &&
+              ps.positionMillis > 0 &&
+              ps.durationMillis !== undefined &&
+              ps.positionMillis >= ps.durationMillis - 200)
+          ) {
+            resolvePlayback();
+          }
+        }
       );
       soundRef.current = sound;
 
-      await new Promise<void>((resolve) => {
-        sound.setOnPlaybackStatusUpdate((ps) => {
-          if (
-            ps.isLoaded &&
-            (ps.didJustFinish ||
-              (!ps.isPlaying &&
-                ps.positionMillis > 0 &&
-                ps.durationMillis !== undefined &&
-                ps.positionMillis >= ps.durationMillis))
-          ) {
-            resolve();
-          }
-        });
-      });
+      // Safety-net timeout: if playback status never fires, unblock after 3 min
+      const safetyTimeout = new Promise<void>((res) => setTimeout(res, 3 * 60 * 1000));
+      await Promise.race([playbackDone, safetyTimeout]);
 
       try { await sound.stopAsync(); } catch {}
       await sound.unloadAsync();
       soundRef.current = null;
     } catch (err) {
       console.error("[VoiceAssistant] Error playing audio:", err);
+    } finally {
+      // Clean up temp file
+      if (tmpPath) {
+        try { await FileSystem.deleteAsync(tmpPath, { idempotent: true }); } catch {}
+      }
     }
   };
 
