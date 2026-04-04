@@ -1,4 +1,10 @@
-const { withAndroidManifest, withInfoPlist } = require("@expo/config-plugins");
+// Resolve @expo/config-plugins with fallback — works in monorepo (via root
+// node_modules) and in EAS cloud (where expo re-exports config-plugins).
+const { withAndroidManifest, withInfoPlist } = (() => {
+  try { return require("@expo/config-plugins"); } catch (_) {}
+  try { return require("expo/config-plugins"); } catch (_) {}
+  throw new Error("Cannot resolve @expo/config-plugins. Add it as a devDependency.");
+})();
 
 /**
  * Expo config plugin for react-native-track-player.
