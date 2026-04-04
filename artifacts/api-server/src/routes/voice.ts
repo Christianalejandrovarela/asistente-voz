@@ -3,6 +3,7 @@ import {
   voiceChat,
   speechToText,
   ensureCompatibleFormat,
+  type ConversationHistoryEntry,
 } from "@workspace/integrations-openai-ai-server/audio";
 
 const router = Router();
@@ -51,10 +52,11 @@ router.post("/voice/transcribe", async (req: Request, res: Response) => {
  * Both run in parallel to minimise latency.
  */
 router.post("/voice/chat", async (req: Request, res: Response) => {
-  const { audio, voice = "nova", language } = req.body as {
+  const { audio, voice = "nova", language, history } = req.body as {
     audio?: string;
     voice?: string;
     language?: string;
+    history?: ConversationHistoryEntry[];
   };
 
   const audioBuffer = parseAudio(audio);
@@ -67,12 +69,16 @@ router.post("/voice/chat", async (req: Request, res: Response) => {
     ? (voice as VoiceParam)
     : "nova";
 
+  const safeHistory: ConversationHistoryEntry[] = Array.isArray(history)
+    ? history.slice(0, 20)
+    : [];
+
   try {
     const { buffer, format } = await ensureCompatibleFormat(audioBuffer);
 
     const [userText, { transcript: assistantText, audioResponse }] = await Promise.all([
       speechToText(buffer, format, language),
-      voiceChat(buffer, selectedVoice, format, "mp3"),
+      voiceChat(buffer, selectedVoice, format, "mp3", safeHistory),
     ]);
 
     res.json({

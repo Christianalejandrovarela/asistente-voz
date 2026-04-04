@@ -6,6 +6,8 @@
  * OpenAPI spec version: 0.1.0
  */
 
+export * from "./conversationMessage";
+export * from "./conversationMessageRole";
 export * from "./healthStatus";
 export * from "./voiceChatRequest";
 export * from "./voiceChatRequestVoice";

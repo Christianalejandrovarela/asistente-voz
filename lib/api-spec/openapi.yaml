@@ -120,6 +120,19 @@ components:
           description: Transcribed text from user audio
       required:
         - text
+    ConversationMessage:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [user, assistant]
+          description: Who sent the message
+        text:
+          type: string
+          description: Text content of the message
+      required:
+        - role
+        - text
     VoiceChatRequest:
       type: object
       properties:
@@ -133,6 +146,11 @@ components:
         language:
           type: string
           description: BCP-47 language code hint for Whisper transcription (e.g. "es", "en", "fr"). Optional.
+        history:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConversationMessage"
+          description: Recent conversation history to provide context to the AI (up to 20 messages). Optional.
       required:
         - audio
     VoiceChatResponse:

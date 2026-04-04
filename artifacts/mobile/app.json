@@ -47,6 +47,12 @@
           "microphonePermission": "Necesitamos el micrófono para que puedas hablar con el asistente de voz IA."
         }
       ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Necesitamos el micrófono para que puedas hablar con el asistente de voz IA."
+        }
+      ],
       "./plugins/withReactNativeTrackPlayer"
     ],
     "experiments": {

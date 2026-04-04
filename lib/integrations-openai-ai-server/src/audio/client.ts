@@ -133,24 +133,41 @@ export async function ensureCompatibleFormat(
   return { buffer: wavBuffer, format: "wav" };
 }
 
+export interface ConversationHistoryEntry {
+  role: "user" | "assistant";
+  text: string;
+}
+
 /** Voice Chat: audio-in, audio-out using gpt-audio. */
 export async function voiceChat(
   audioBuffer: Buffer,
   voice: "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer" = "alloy",
   inputFormat: "wav" | "mp3" = "wav",
-  outputFormat: "wav" | "mp3" = "mp3"
+  outputFormat: "wav" | "mp3" = "mp3",
+  history: ConversationHistoryEntry[] = []
 ): Promise<{ transcript: string; audioResponse: Buffer }> {
   const audioBase64 = audioBuffer.toString("base64");
+
+  type ChatMessage = Parameters<typeof openai.chat.completions.create>[0]["messages"][number];
+
+  const historyMessages: ChatMessage[] = history.map((entry) => ({
+    role: entry.role,
+    content: entry.text,
+  }));
+
   const response = await openai.chat.completions.create({
     model: "gpt-audio",
     modalities: ["text", "audio"],
     audio: { voice, format: outputFormat },
-    messages: [{
-      role: "user",
-      content: [
-        { type: "input_audio", input_audio: { data: audioBase64, format: inputFormat } },
-      ],
-    }],
+    messages: [
+      ...historyMessages,
+      {
+        role: "user",
+        content: [
+          { type: "input_audio", input_audio: { data: audioBase64, format: inputFormat } },
+        ],
+      },
+    ],
   });
   const message = response.choices[0]?.message as unknown as GptAudioMessage;
   const transcript = message?.audio?.transcript ?? message?.content ?? "";

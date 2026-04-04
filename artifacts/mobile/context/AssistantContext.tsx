@@ -1,10 +1,17 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Audio } from "expo-av";
 import * as FileSystem from "expo-file-system/legacy";
+import {
+  useAudioRecorder,
+  RecordingPresets,
+  requestRecordingPermissionsAsync,
+  setAudioModeAsync,
+} from "expo-audio";
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 
 import { setupTrackPlayer, destroyTrackPlayer } from "@/services/trackPlayer";
 import { startBackgroundService } from "@/services/backgroundService";
+import { initDb, getMessages, addMessage, clearMessages } from "@/services/conversationDb";
 
 export type AssistantStatus = "idle" | "recording" | "processing" | "speaking";
 
@@ -39,7 +46,6 @@ interface AssistantContextValue {
 
 const AssistantContext = createContext<AssistantContextValue | null>(null);
 
-const MESSAGES_KEY = "@voice_assistant_messages";
 const SETTINGS_KEY = "@voice_assistant_settings";
 
 const DEFAULT_SETTINGS: AssistantSettings = { voice: "nova", language: "es" };
@@ -53,7 +59,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [settings, setSettings] = useState<AssistantSettings>(DEFAULT_SETTINGS);
   const [isBluetoothActive, setIsBluetoothActive] = useState(false);
-  const recordingRef = useRef<Audio.Recording | null>(null);
+  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const soundRef = useRef<Audio.Sound | null>(null);
   const statusRef = useRef<AssistantStatus>("idle");
 
@@ -65,15 +71,6 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     void loadStoredData();
   }, []);
 
-  /**
-   * Bluetooth listener setup lives at the provider level so it remains active
-   * for the full app lifetime — even when the main screen is unmounted or the
-   * app moves to the background (JS thread stays alive via the audio session
-   * and the background foreground-service).
-   *
-   * A stable ref is used so the callback always reads the latest status
-   * without re-registering listeners when status changes.
-   */
   const handleRemoteToggleRef = useRef<() => void>(() => {});
   useEffect(() => {
     handleRemoteToggleRef.current = () => {
@@ -103,46 +100,40 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
   const loadStoredData = async () => {
     try {
-      const [storedMessages, storedSettings] = await Promise.all([
-        AsyncStorage.getItem(MESSAGES_KEY),
+      await initDb();
+      const [storedMsgs, storedSettings] = await Promise.all([
+        getMessages(200),
         AsyncStorage.getItem(SETTINGS_KEY),
       ]);
-      if (storedMessages) setMessages(JSON.parse(storedMessages) as ChatMessage[]);
-      if (storedSettings) setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(storedSettings) as Partial<AssistantSettings> });
+      setMessages(storedMsgs);
+      if (storedSettings) {
+        setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(storedSettings) as Partial<AssistantSettings> });
+      }
     } catch {
-      // Silently ignore — app still functions without persisted data.
     }
-  };
-
-  const saveMessages = async (msgs: ChatMessage[]) => {
-    try {
-      await AsyncStorage.setItem(MESSAGES_KEY, JSON.stringify(msgs.slice(-50)));
-    } catch {}
   };
 
   const addMessages = useCallback((newMsgs: ChatMessage[]) => {
     setMessages((prev) => {
       const updated = [...prev, ...newMsgs];
-      void saveMessages(updated);
       return updated;
     });
+    void Promise.all(newMsgs.map((m) => addMessage(m)));
   }, []);
 
   const startRecordingFn = async () => {
     if (statusRef.current !== "idle") return;
     try {
-      const { status: permStatus } = await Audio.requestPermissionsAsync();
-      if (permStatus !== "granted") return;
+      const { granted } = await requestRecordingPermissionsAsync();
+      if (!granted) return;
 
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
+      await setAudioModeAsync({
+        allowsRecording: true,
+        playsInSilentMode: true,
       });
 
-      const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY
-      );
-      recordingRef.current = recording;
+      await recorder.prepareToRecordAsync();
+      recorder.record();
       setStatus("recording");
     } catch (err) {
       console.error("Error starting recording:", err);
@@ -151,14 +142,12 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   };
 
   const stopRecordingFn = async () => {
-    if (statusRef.current !== "recording" || !recordingRef.current) return;
+    if (statusRef.current !== "recording") return;
     setStatus("processing");
 
     try {
-      const recording = recordingRef.current;
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      recordingRef.current = null;
+      await recorder.stop();
+      const uri = recorder.uri;
 
       if (!uri) throw new Error("No recording URI available");
 
@@ -172,6 +161,10 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         : "http://localhost:8080/api/voice/chat";
 
       const currentSettings = settings;
+
+      const recentHistory = await getMessages(20);
+      const historyPayload = recentHistory.map((m) => ({ role: m.role, text: m.text }));
+
       const response = await fetch(apiUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -179,6 +172,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
           audio: base64Audio,
           voice: currentSettings.voice,
           language: currentSettings.language,
+          history: historyPayload,
         }),
       });
 
@@ -251,7 +245,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
   const clearHistory = useCallback(() => {
     setMessages([]);
-    void AsyncStorage.removeItem(MESSAGES_KEY);
+    void clearMessages();
   }, []);
 
   const updateSettings = useCallback((newSettings: Partial<AssistantSettings>) => {

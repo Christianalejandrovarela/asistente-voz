@@ -5,6 +5,7 @@
  * API specification
  * OpenAPI spec version: 0.1.0
  */
+import type { ConversationMessage } from "./conversationMessage";
 import type { VoiceChatRequestVoice } from "./voiceChatRequestVoice";
 
 export interface VoiceChatRequest {
@@ -14,4 +15,6 @@ export interface VoiceChatRequest {
   voice?: VoiceChatRequestVoice;
   /** BCP-47 language code hint for Whisper transcription (e.g. "es", "en", "fr"). Optional. */
   language?: string;
+  /** Recent conversation history to provide context to the AI (up to 20 messages). Optional. */
+  history?: ConversationMessage[];
 }

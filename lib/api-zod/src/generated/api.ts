@@ -57,6 +57,17 @@ export const VoiceChatBody = zod.object({
     .describe(
       'BCP-47 language code hint for Whisper transcription (e.g. \"es\", \"en\", \"fr\"). Optional.',
     ),
+  history: zod
+    .array(
+      zod.object({
+        role: zod.enum(["user", "assistant"]).describe("Who sent the message"),
+        text: zod.string().describe("Text content of the message"),
+      }),
+    )
+    .optional()
+    .describe(
+      "Recent conversation history to provide context to the AI (up to 20 messages). Optional.",
+    ),
 });
 
 export const VoiceChatResponse = zod.object({

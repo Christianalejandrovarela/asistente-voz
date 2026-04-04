@@ -22,6 +22,24 @@ export interface VoiceTranscribeResponse {
 }
 
 /**
+ * Who sent the message
+ */
+export type ConversationMessageRole =
+  (typeof ConversationMessageRole)[keyof typeof ConversationMessageRole];
+
+export const ConversationMessageRole = {
+  user: "user",
+  assistant: "assistant",
+} as const;
+
+export interface ConversationMessage {
+  /** Who sent the message */
+  role: ConversationMessageRole;
+  /** Text content of the message */
+  text: string;
+}
+
+/**
  * gpt-4o-audio-preview voice for assistant response
  */
 export type VoiceChatRequestVoice =
@@ -43,6 +61,8 @@ export interface VoiceChatRequest {
   voice?: VoiceChatRequestVoice;
   /** BCP-47 language code hint for Whisper transcription (e.g. "es", "en", "fr"). Optional. */
   language?: string;
+  /** Recent conversation history to provide context to the AI (up to 20 messages). Optional. */
+  history?: ConversationMessage[];
 }
 
 export interface VoiceChatResponse {
