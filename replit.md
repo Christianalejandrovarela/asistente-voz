@@ -60,3 +60,4 @@ See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and pa
 - Native Bluetooth controls (react-native-track-player) and background service (react-native-background-actions) require an EAS native build. Core AI voice works in Expo Go.
 - expo-av is deprecated in SDK 54 (use expo-audio/expo-video in future). Currently functional.
 - OpenAI integration uses Replit AI Integrations proxy — no user API key needed.
+- **RNTP Kotlin patch**: `react-native-track-player@4.1.2` has a Kotlin nullability bug with RN 0.81 — `originalItem` is `Bundle?` but `Arguments.fromBundle()` requires non-nullable `Bundle`. Fixed via pnpm native patch (`patches/react-native-track-player@4.1.2.patch`) adding `!!` at MusicModule.kt lines 548 and 588. Referenced in root `package.json` under `pnpm.patchedDependencies`. pnpm auto-applies during install including EAS builds.
