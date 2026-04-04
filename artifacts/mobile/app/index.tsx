@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef } from "react";
+import React, { useCallback, useRef } from "react";
 import {
   FlatList,
   Platform,
@@ -18,27 +18,27 @@ import { AssistantStatus, ChatMessage, useAssistant } from "@/context/AssistantC
 import { useColors } from "@/hooks/useColors";
 
 const STATUS_LABELS: Record<AssistantStatus, string> = {
-  idle: "Pulsa para hablar",
+  idle: "Iniciando...",
   recording: "Escuchando...",
-  processing: "Procesando...",
+  processing: "Pensando...",
   speaking: "Respondiendo...",
 };
 
 export default function MainScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { status, messages, isBluetoothActive, debugInfo, startRecording, stopRecording } = useAssistant();
+  const { status, isSessionActive, messages, isBluetoothActive, debugInfo, startSession, stopSession } = useAssistant();
   const listRef = useRef<FlatList>(null);
 
   const handleOrbPress = useCallback(async () => {
-    if (status === "idle") {
+    if (!isSessionActive) {
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-      await startRecording();
-    } else if (status === "recording") {
+      await startSession();
+    } else {
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-      await stopRecording();
+      await stopSession();
     }
-  }, [status, startRecording, stopRecording]);
+  }, [isSessionActive, startSession, stopSession]);
 
   const webTopPad = Platform.OS === "web" ? 67 : 0;
   const webBotPad = Platform.OS === "web" ? 34 : 0;
@@ -48,6 +48,12 @@ export default function MainScreen() {
   );
 
   const reversedMessages = [...messages].reverse();
+
+  const statusLabel = isSessionActive
+    ? STATUS_LABELS[status]
+    : "Toca para comenzar";
+
+  const hintText = isSessionActive ? "Toca para terminar" : " ";
 
   return (
     <View
@@ -68,6 +74,12 @@ export default function MainScreen() {
             <View style={styles.btBadge}>
               <Feather name="bluetooth" size={12} color={colors.primary} />
               <Text style={[styles.btText, { color: colors.primary }]}>BT</Text>
+            </View>
+          )}
+          {isSessionActive && (
+            <View style={[styles.liveBadge, { backgroundColor: "rgba(34, 197, 94, 0.15)" }]}>
+              <View style={styles.liveDot} />
+              <Text style={[styles.liveText, { color: "#22c55e" }]}>EN VIVO</Text>
             </View>
           )}
         </View>
@@ -94,7 +106,7 @@ export default function MainScreen() {
           <View style={styles.emptyState}>
             <Feather name="mic" size={28} color={colors.mutedForeground} />
             <Text style={[styles.emptyText, { color: colors.mutedForeground }]}>
-              Mantén pulsado el botón para hablar
+              Toca el botón para iniciar{"\n"}una conversación
             </Text>
           </View>
         }
@@ -102,24 +114,22 @@ export default function MainScreen() {
 
       <View style={styles.orbArea}>
         <Text style={[styles.statusLabel, { color: colors.mutedForeground }]}>
-          {STATUS_LABELS[status]}
+          {statusLabel}
         </Text>
 
         <Pressable
           onPress={handleOrbPress}
-          disabled={status === "processing" || status === "speaking"}
           style={({ pressed }) => [
             styles.orbWrapper,
-            (status === "processing" || status === "speaking") && styles.orbDisabled,
             pressed && styles.orbPressed,
           ]}
           testID="voice-orb"
         >
-          <VoiceOrb status={status} size={100} />
+          <VoiceOrb status={isSessionActive ? status : "idle"} size={100} />
         </Pressable>
 
         <Text style={[styles.hintText, { color: colors.mutedForeground }]}>
-          {status === "recording" ? "Toca para enviar" : " "}
+          {hintText}
         </Text>
       </View>
 
@@ -159,6 +169,25 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: "Inter_600SemiBold",
   },
+  liveBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 20,
+  },
+  liveDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: "#22c55e",
+  },
+  liveText: {
+    fontSize: 11,
+    fontFamily: "Inter_600SemiBold",
+    letterSpacing: 0.8,
+  },
   settingsBtn: { padding: 8 },
   list: { flex: 1 },
   listContent: {
@@ -192,7 +221,6 @@ const styles = StyleSheet.create({
     letterSpacing: 0.3,
   },
   orbWrapper: { padding: 8 },
-  orbDisabled: { opacity: 0.8 },
   orbPressed: { transform: [{ scale: 0.96 }] },
   hintText: {
     fontSize: 13,

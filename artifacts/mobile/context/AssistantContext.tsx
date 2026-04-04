@@ -37,13 +37,14 @@ interface RollingBufferContext {
 
 interface AssistantContextValue {
   status: AssistantStatus;
+  isSessionActive: boolean;
   messages: ChatMessage[];
   settings: AssistantSettings;
   isBluetoothActive: boolean;
   rollingBuffer: RollingBufferContext;
   debugInfo: string;
-  startRecording: () => Promise<void>;
-  stopRecording: () => Promise<void>;
+  startSession: () => Promise<void>;
+  stopSession: () => Promise<void>;
   clearHistory: () => void;
   updateSettings: (settings: Partial<AssistantSettings>) => void;
   toggleRollingBuffer: (enabled: boolean) => Promise<void>;
@@ -55,6 +56,11 @@ const SETTINGS_KEY = "@voice_assistant_settings";
 const ROLLING_BUFFER_KEY = "@rolling_buffer_active";
 
 const DEFAULT_SETTINGS: AssistantSettings = { voice: "nova", language: "es" };
+
+const VAD_SILENCE_THRESHOLD_DB = -45;
+const VAD_SILENCE_DURATION_MS = 1500;
+const VAD_MIN_SPEECH_MS = 300;
+const MAX_RECORDING_MS = 60_000;
 
 function generateId(): string {
   return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
@@ -79,31 +85,43 @@ async function readUriAsBase64(uri: string): Promise<string> {
 
 export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<AssistantStatus>("idle");
+  const [isSessionActive, setIsSessionActive] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [settings, setSettings] = useState<AssistantSettings>(DEFAULT_SETTINGS);
   const [isBluetoothActive, setIsBluetoothActive] = useState(false);
   const [isRollingBufferActive, setIsRollingBufferActive] = useState(false);
   const [debugInfo, setDebugInfo] = useState("Iniciando...");
+
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
   const statusRef = useRef<AssistantStatus>("idle");
+  const isSessionActiveRef = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const maxRecordingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const settingsRef = useRef<AssistantSettings>(DEFAULT_SETTINGS);
 
   useEffect(() => {
     statusRef.current = status;
   }, [status]);
 
   useEffect(() => {
-    void loadStoredData();
-  }, []);
+    settingsRef.current = settings;
+  }, [settings]);
 
   const handleRemoteToggleRef = useRef<() => void>(() => {});
   useEffect(() => {
     handleRemoteToggleRef.current = () => {
-      const s = statusRef.current;
-      if (s === "idle") void startRecordingFn();
-      else if (s === "recording") void stopRecordingFn();
+      if (!isSessionActiveRef.current) {
+        void startSessionFn();
+      } else {
+        void stopSessionFn();
+      }
     };
   });
+
+  useEffect(() => {
+    void loadStoredData();
+  }, []);
 
   useEffect(() => {
     let btCleanup: (() => void) | null = null;
@@ -114,28 +132,18 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       try {
         const [tpResult] = await Promise.all([
           setupTrackPlayer(
-            () => {
-              console.log("[AssistantContext] RemotePlay → toggle, status:", statusRef.current);
-              setDebugInfo(`RemotePlay! status=${statusRef.current}`);
-              handleRemoteToggleRef.current();
-            },
-            () => {
-              console.log("[AssistantContext] RemotePause → toggle, status:", statusRef.current);
-              setDebugInfo(`RemotePause! status=${statusRef.current}`);
-              handleRemoteToggleRef.current();
-            }
+            () => { handleRemoteToggleRef.current(); },
+            () => { handleRemoteToggleRef.current(); }
           ),
           startBackgroundService(),
         ]);
         btOk = tpResult;
-        setDebugInfo(btOk ? "TrackPlayer OK - pista reproduciendo" : "TrackPlayer NO disponible");
+        setDebugInfo(btOk ? "TrackPlayer OK" : "TrackPlayer no disponible");
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setDebugInfo(`Error TrackPlayer: ${msg}`);
-        console.log("[AssistantContext] TrackPlayer error:", err);
       }
       setIsBluetoothActive(btOk);
-      console.log("[AssistantContext] TrackPlayer initialized:", btOk);
 
       if (btOk) {
         const bufferStarted = await RollingBufferManager.start();
@@ -143,10 +151,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
           setIsRollingBufferActive(true);
           await AsyncStorage.setItem(ROLLING_BUFFER_KEY, "true");
         }
-
-        btCleanup = onBluetoothDisconnect(() => {
-          void handleBluetoothDisconnect();
-        });
+        btCleanup = onBluetoothDisconnect(() => { void handleBluetoothDisconnect(); });
       }
     };
     void init();
@@ -170,7 +175,6 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const handleBluetoothDisconnect = async () => {
-    console.log("[VoiceAssistant] Bluetooth disconnected, stopping services");
     await RollingBufferManager.stop();
     setIsRollingBufferActive(false);
     await AsyncStorage.setItem(ROLLING_BUFFER_KEY, "false");
@@ -197,17 +201,26 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     void Promise.all(newMsgs.map((m) => addMessage(m)));
   }, []);
 
-  const startRecordingFn = async () => {
+  const clearMaxTimer = () => {
+    if (maxRecordingTimerRef.current) {
+      clearTimeout(maxRecordingTimerRef.current);
+      maxRecordingTimerRef.current = null;
+    }
+  };
+
+  const startListeningFn = async () => {
+    if (!isSessionActiveRef.current) return;
     if (statusRef.current !== "idle") return;
+
     try {
       const { status: permStatus } = await Audio.requestPermissionsAsync();
       if (permStatus !== "granted") {
-        console.warn("[VoiceAssistant] Microphone permission denied");
         Alert.alert(
           "Permiso de micrófono",
-          "Para usar el asistente necesitas conceder acceso al micrófono en los ajustes de tu dispositivo.",
+          "Para usar el asistente necesitas conceder acceso al micrófono en los ajustes.",
           [{ text: "OK" }]
         );
+        await stopSessionFn();
         return;
       }
 
@@ -220,31 +233,88 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       });
 
       const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY
+        {
+          ...Audio.RecordingOptionsPresets.HIGH_QUALITY,
+          isMeteringEnabled: true,
+        },
+        undefined,
+        100
       );
+
       recordingRef.current = recording;
       setStatus("recording");
+
+      let hasSpeech = false;
+      let silenceStart: number | null = null;
+      let speechStartTime: number | null = null;
+      let vadTriggered = false;
+
+      recording.setOnRecordingStatusUpdate((s) => {
+        if (!isSessionActiveRef.current || vadTriggered) return;
+        if (!s.isRecording) return;
+
+        const metering = s.metering ?? -160;
+        const now = Date.now();
+
+        if (metering > VAD_SILENCE_THRESHOLD_DB) {
+          if (!hasSpeech) {
+            hasSpeech = true;
+            speechStartTime = now;
+          }
+          silenceStart = null;
+        } else if (hasSpeech) {
+          if (!silenceStart) silenceStart = now;
+          const speechDuration = speechStartTime ? now - speechStartTime : 0;
+          if (
+            now - silenceStart >= VAD_SILENCE_DURATION_MS &&
+            speechDuration >= VAD_MIN_SPEECH_MS
+          ) {
+            vadTriggered = true;
+            recording.setOnRecordingStatusUpdate(null);
+            clearMaxTimer();
+            void sendCurrentRecordingFn();
+          }
+        }
+      });
+
+      maxRecordingTimerRef.current = setTimeout(() => {
+        if (!vadTriggered && isSessionActiveRef.current && statusRef.current === "recording") {
+          vadTriggered = true;
+          void sendCurrentRecordingFn();
+        }
+      }, MAX_RECORDING_MS);
     } catch (err) {
-      console.error("[VoiceAssistant] Error starting recording:", err);
+      console.error("[VoiceAssistant] Error starting listening:", err);
       setStatus("idle");
       await RollingBufferManager.resume();
       await resumeSilentTrack();
+      if (isSessionActiveRef.current) {
+        setTimeout(() => { void startListeningFn(); }, 500);
+      }
     }
   };
 
-  const stopRecordingFn = async () => {
+  const sendCurrentRecordingFn = async () => {
+    clearMaxTimer();
     if (statusRef.current !== "recording" || !recordingRef.current) return;
     setStatus("processing");
 
     try {
       const recording = recordingRef.current;
+      recordingRef.current = null;
       await recording.stopAndUnloadAsync();
       const uri = recording.getURI();
-      recordingRef.current = null;
 
-      if (!uri) throw new Error("No recording URI available");
+      if (!uri) throw new Error("No recording URI");
 
       const base64Audio = await readUriAsBase64(uri);
+
+      if (!isSessionActiveRef.current) {
+        setStatus("idle");
+        await RollingBufferManager.resume();
+        await resumeSilentTrack();
+        return;
+      }
 
       const domain = process.env.EXPO_PUBLIC_DOMAIN;
       const apiUrl = domain
@@ -252,16 +322,15 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         : "http://localhost:8080/api/voice/chat";
 
       await purgeOldMessages();
-      const currentSettings = settings;
+      const currentSettings = settingsRef.current;
       const recentHistory = await getMessages(20);
-
       const contextText = RollingBufferManager.getContextText();
 
       const historyPayload: { role: string; text: string }[] = [];
       if (contextText.length > 0) {
         historyPayload.push({
           role: "user",
-          text: `[Contexto de los últimos minutos de conversación ambiental]: ${contextText}`,
+          text: `[Contexto ambiental]: ${contextText}`,
         });
       }
       for (const m of recentHistory) {
@@ -270,6 +339,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
+      abortControllerRef.current = new AbortController();
       const response = await fetch(apiUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -279,45 +349,100 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
           language: currentSettings.language,
           history: historyPayload.slice(-20),
         }),
+        signal: abortControllerRef.current.signal,
       });
+      abortControllerRef.current = null;
+
+      if (!isSessionActiveRef.current) {
+        setStatus("idle");
+        await RollingBufferManager.resume();
+        await resumeSilentTrack();
+        return;
+      }
 
       if (!response.ok) {
         const errText = await response.text();
-        throw new Error(`API error ${response.status}: ${errText}`);
+        throw new Error(`API ${response.status}: ${errText}`);
       }
 
       const data = await response.json() as VoiceApiResponse;
-
       const now = Date.now();
       addMessages([
         { id: generateId(), role: "user", text: data.userText, timestamp: now },
         { id: generateId(), role: "assistant", text: data.assistantText, timestamp: now + 1 },
       ]);
 
+      if (!isSessionActiveRef.current) {
+        setStatus("idle");
+        await RollingBufferManager.resume();
+        await resumeSilentTrack();
+        return;
+      }
+
       setStatus("speaking");
       await playResponseAudio(data.audio);
-      setStatus("idle");
-      await RollingBufferManager.resume();
-      await resumeSilentTrack();
+
+      if (isSessionActiveRef.current) {
+        setStatus("idle");
+        void startListeningFn();
+      } else {
+        setStatus("idle");
+        await RollingBufferManager.resume();
+        await resumeSilentTrack();
+      }
     } catch (err) {
-      console.error("[VoiceAssistant] Error processing voice:", err);
-      const message = err instanceof Error ? err.message : "Error desconocido";
-      Alert.alert("Error de voz", `No se pudo procesar el audio: ${message}`, [{ text: "OK" }]);
+      const isAbort = err instanceof Error && err.name === "AbortError";
+      if (!isAbort) {
+        console.error("[VoiceAssistant] Error sending recording:", err);
+        const message = err instanceof Error ? err.message : "Error desconocido";
+        Alert.alert("Error", `No se pudo procesar: ${message}`, [{ text: "OK" }]);
+      }
       setStatus("idle");
       await RollingBufferManager.resume();
       await resumeSilentTrack();
+      if (isSessionActiveRef.current && !isAbort) {
+        setTimeout(() => { void startListeningFn(); }, 1000);
+      }
     }
   };
 
-  const startRecording = useCallback(async () => {
-    await startRecordingFn();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const startSessionFn = async () => {
+    if (isSessionActiveRef.current) return;
+    isSessionActiveRef.current = true;
+    setIsSessionActive(true);
+    await startListeningFn();
+  };
 
-  const stopRecording = useCallback(async () => {
-    await stopRecordingFn();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings]);
+  const stopSessionFn = async () => {
+    if (!isSessionActiveRef.current) return;
+    isSessionActiveRef.current = false;
+    setIsSessionActive(false);
+
+    clearMaxTimer();
+
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+
+    if (recordingRef.current) {
+      try {
+        recordingRef.current.setOnRecordingStatusUpdate(null);
+        await recordingRef.current.stopAndUnloadAsync();
+      } catch {}
+      recordingRef.current = null;
+    }
+
+    if (soundRef.current) {
+      try { await soundRef.current.stopAsync(); } catch {}
+      try { await soundRef.current.unloadAsync(); } catch {}
+      soundRef.current = null;
+    }
+
+    await RollingBufferManager.resume();
+    await resumeSilentTrack();
+    setStatus("idle");
+  };
 
   const playResponseAudio = async (base64Audio: string) => {
     try {
@@ -328,10 +453,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       }
 
       const tmpPath = `${FileSystem.cacheDirectory ?? ""}ai_response.mp3`;
-
-      await FileSystem.writeAsStringAsync(tmpPath, base64Audio, {
-        encoding: "base64",
-      });
+      await FileSystem.writeAsStringAsync(tmpPath, base64Audio, { encoding: "base64" });
 
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: false,
@@ -348,8 +470,15 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       soundRef.current = sound;
 
       await new Promise<void>((resolve) => {
-        sound.setOnPlaybackStatusUpdate((playStatus) => {
-          if (playStatus.isLoaded && (playStatus.didJustFinish || !playStatus.isPlaying && playStatus.positionMillis > 0 && playStatus.durationMillis && playStatus.positionMillis >= playStatus.durationMillis)) {
+        sound.setOnPlaybackStatusUpdate((ps) => {
+          if (
+            ps.isLoaded &&
+            (ps.didJustFinish ||
+              (!ps.isPlaying &&
+                ps.positionMillis > 0 &&
+                ps.durationMillis !== undefined &&
+                ps.positionMillis >= ps.durationMillis))
+          ) {
             resolve();
           }
         });
@@ -359,9 +488,19 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       await sound.unloadAsync();
       soundRef.current = null;
     } catch (err) {
-      console.error("[VoiceAssistant] Error playing audio response:", err);
+      console.error("[VoiceAssistant] Error playing audio:", err);
     }
   };
+
+  const startSession = useCallback(async () => {
+    await startSessionFn();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const stopSession = useCallback(async () => {
+    await stopSessionFn();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const clearHistory = useCallback(() => {
     setMessages([]);
@@ -382,7 +521,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       if (!ok) {
         Alert.alert(
           "Permiso de micrófono",
-          "Para la grabación continua necesitas conceder acceso al micrófono en los ajustes de tu dispositivo.",
+          "Para la grabación continua necesitas conceder acceso al micrófono en los ajustes.",
           [{ text: "OK" }]
         );
         return;
@@ -405,13 +544,14 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     <AssistantContext.Provider
       value={{
         status,
+        isSessionActive,
         messages,
         settings,
         isBluetoothActive,
         rollingBuffer,
         debugInfo,
-        startRecording,
-        stopRecording,
+        startSession,
+        stopSession,
         clearHistory,
         updateSettings,
         toggleRollingBuffer,
