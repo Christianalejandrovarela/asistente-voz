@@ -196,7 +196,7 @@ class RollingBufferManagerImpl {
       const kept: BufferSegment[] = [];
 
       await Promise.all(
-        files.map(async (name) => {
+        files.map(async (name: string) => {
           const match = name.match(/^seg_(\d+)\.m4a$/);
           if (!match) return;
           const ts = parseInt(match[1], 10);
