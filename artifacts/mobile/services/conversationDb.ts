@@ -1,47 +1,34 @@
-import * as SQLite from "expo-sqlite";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import type { ChatMessage } from "@/context/AssistantContext";
 
-let db: SQLite.SQLiteDatabase | null = null;
-
-async function getDb(): Promise<SQLite.SQLiteDatabase> {
-  if (!db) {
-    db = await SQLite.openDatabaseAsync("conversation.db");
-  }
-  return db;
-}
+const MESSAGES_KEY = "@voice_assistant_messages_v2";
 
 export async function initDb(): Promise<void> {
-  const database = await getDb();
-  await database.execAsync(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id TEXT PRIMARY KEY NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-      text TEXT NOT NULL,
-      timestamp INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
-  `);
 }
 
 export async function getMessages(limit = 50): Promise<ChatMessage[]> {
-  const database = await getDb();
-  const rows = await database.getAllAsync<ChatMessage>(
-    "SELECT id, role, text, timestamp FROM messages ORDER BY timestamp DESC LIMIT ?",
-    [limit]
-  );
-  return rows.reverse();
+  try {
+    const raw = await AsyncStorage.getItem(MESSAGES_KEY);
+    if (!raw) return [];
+    const all = JSON.parse(raw) as ChatMessage[];
+    return all.slice(-limit);
+  } catch {
+    return [];
+  }
 }
 
 export async function addMessage(message: ChatMessage): Promise<void> {
-  const database = await getDb();
-  await database.runAsync(
-    "INSERT OR REPLACE INTO messages (id, role, text, timestamp) VALUES (?, ?, ?, ?)",
-    [message.id, message.role, message.text, message.timestamp]
-  );
+  try {
+    const raw = await AsyncStorage.getItem(MESSAGES_KEY);
+    const all: ChatMessage[] = raw ? (JSON.parse(raw) as ChatMessage[]) : [];
+    all.push(message);
+    await AsyncStorage.setItem(MESSAGES_KEY, JSON.stringify(all.slice(-500)));
+  } catch {}
 }
 
 export async function clearMessages(): Promise<void> {
-  const database = await getDb();
-  await database.runAsync("DELETE FROM messages");
+  try {
+    await AsyncStorage.removeItem(MESSAGES_KEY);
+  } catch {}
 }
