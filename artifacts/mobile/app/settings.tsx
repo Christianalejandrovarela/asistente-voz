@@ -5,6 +5,7 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   View,
 } from "react-native";
@@ -43,7 +44,7 @@ type LanguageCode = (typeof LANGUAGES)[number]["code"];
 export default function SettingsScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { settings, updateSettings, clearHistory } = useAssistant();
+  const { settings, updateSettings, clearHistory, rollingBuffer, toggleRollingBuffer } = useAssistant();
 
   const webTopPad = Platform.OS === "web" ? 67 : 0;
   const webBotPad = Platform.OS === "web" ? 34 : 0;
@@ -142,6 +143,26 @@ export default function SettingsScreen() {
               </Pressable>
             );
           })}
+        </View>
+
+        {/* ─── Rolling Buffer ─── */}
+        <Text style={[styles.sectionLabel, { color: colors.mutedForeground }]}>GRABACIÓN CONTINUA</Text>
+        <View style={[styles.section, { backgroundColor: colors.card, borderColor: colors.border }]}>
+          <View style={styles.switchRow}>
+            <View style={styles.switchInfo}>
+              <Text style={[styles.infoTitle, { color: colors.foreground }]}>Grabación continua</Text>
+              <Text style={[styles.infoDesc, { color: colors.mutedForeground }]}>
+                Graba en segundo plano y mantiene los últimos 10 minutos de audio. Requiere build nativo con EAS.
+              </Text>
+            </View>
+            <Switch
+              value={rollingBuffer.isActive}
+              onValueChange={(val) => void toggleRollingBuffer(val)}
+              trackColor={{ false: colors.border, true: colors.primary }}
+              thumbColor="#fff"
+              testID="rolling-buffer-toggle"
+            />
+          </View>
         </View>
 
         {/* ─── Info ─── */}
@@ -287,5 +308,15 @@ const styles = StyleSheet.create({
   dangerText: {
     fontSize: 16,
     fontFamily: "Inter_500Medium",
+  },
+  switchRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    gap: 12,
+  },
+  switchInfo: {
+    flex: 1,
   },
 });

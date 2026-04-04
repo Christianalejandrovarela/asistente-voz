@@ -7,6 +7,7 @@ import { Alert, Platform } from "react-native";
 import { setupTrackPlayer, destroyTrackPlayer } from "@/services/trackPlayer";
 import { startBackgroundService } from "@/services/backgroundService";
 import { initDb, getMessages, addMessage, clearMessages } from "@/services/conversationDb";
+import { RollingBufferManager, type BufferSegment } from "@/services/rollingBufferManager";
 
 export type AssistantStatus = "idle" | "recording" | "processing" | "speaking";
 
@@ -28,20 +29,28 @@ export interface AssistantSettings {
   language: string;
 }
 
+interface RollingBufferContext {
+  isActive: boolean;
+  getSegments: () => BufferSegment[];
+}
+
 interface AssistantContextValue {
   status: AssistantStatus;
   messages: ChatMessage[];
   settings: AssistantSettings;
   isBluetoothActive: boolean;
+  rollingBuffer: RollingBufferContext;
   startRecording: () => Promise<void>;
   stopRecording: () => Promise<void>;
   clearHistory: () => void;
   updateSettings: (settings: Partial<AssistantSettings>) => void;
+  toggleRollingBuffer: (enabled: boolean) => Promise<void>;
 }
 
 const AssistantContext = createContext<AssistantContextValue | null>(null);
 
 const SETTINGS_KEY = "@voice_assistant_settings";
+const ROLLING_BUFFER_KEY = "@rolling_buffer_active";
 
 const DEFAULT_SETTINGS: AssistantSettings = { voice: "nova", language: "es" };
 
@@ -76,6 +85,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [settings, setSettings] = useState<AssistantSettings>(DEFAULT_SETTINGS);
   const [isBluetoothActive, setIsBluetoothActive] = useState(false);
+  const [isRollingBufferActive, setIsRollingBufferActive] = useState(false);
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
   const statusRef = useRef<AssistantStatus>("idle");
@@ -127,13 +137,22 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const loadStoredData = async () => {
     try {
       await initDb();
-      const [storedMsgs, storedSettings] = await Promise.all([
+      const [storedMsgs, storedSettings, storedBuffer] = await Promise.all([
         getMessages(200),
         AsyncStorage.getItem(SETTINGS_KEY),
+        AsyncStorage.getItem(ROLLING_BUFFER_KEY),
       ]);
       setMessages(storedMsgs);
       if (storedSettings) {
         setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(storedSettings) as Partial<AssistantSettings> });
+      }
+      if (storedBuffer === "true") {
+        const started = await RollingBufferManager.start();
+        if (started) {
+          setIsRollingBufferActive(true);
+        } else {
+          await AsyncStorage.setItem(ROLLING_BUFFER_KEY, "false");
+        }
       }
     } catch {
     }
@@ -158,6 +177,8 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
+      await RollingBufferManager.pause();
+
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
@@ -171,6 +192,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     } catch (err) {
       console.error("[VoiceAssistant] Error starting recording:", err);
       setStatus("idle");
+      await RollingBufferManager.resume();
     }
   };
 
@@ -224,11 +246,13 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       setStatus("speaking");
       await playResponseAudio(data.audio);
       setStatus("idle");
+      await RollingBufferManager.resume();
     } catch (err) {
       console.error("[VoiceAssistant] Error processing voice:", err);
       const message = err instanceof Error ? err.message : "Error desconocido";
       Alert.alert("Error de voz", `No se pudo procesar el audio: ${message}`, [{ text: "OK" }]);
       setStatus("idle");
+      await RollingBufferManager.resume();
     }
   };
 
@@ -290,6 +314,31 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const toggleRollingBuffer = useCallback(async (enabled: boolean) => {
+    if (enabled) {
+      const ok = await RollingBufferManager.start();
+      if (!ok) {
+        Alert.alert(
+          "Permiso de micrófono",
+          "Para la grabación continua necesitas conceder acceso al micrófono en los ajustes de tu dispositivo.",
+          [{ text: "OK" }]
+        );
+        return;
+      }
+      setIsRollingBufferActive(true);
+      await AsyncStorage.setItem(ROLLING_BUFFER_KEY, "true");
+    } else {
+      await RollingBufferManager.stop();
+      setIsRollingBufferActive(false);
+      await AsyncStorage.setItem(ROLLING_BUFFER_KEY, "false");
+    }
+  }, []);
+
+  const rollingBuffer: RollingBufferContext = {
+    isActive: isRollingBufferActive,
+    getSegments: () => RollingBufferManager.getSegments(),
+  };
+
   return (
     <AssistantContext.Provider
       value={{
@@ -297,10 +346,12 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         messages,
         settings,
         isBluetoothActive,
+        rollingBuffer,
         startRecording,
         stopRecording,
         clearHistory,
         updateSettings,
+        toggleRollingBuffer,
       }}
     >
       {children}

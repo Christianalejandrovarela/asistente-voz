@@ -49,7 +49,11 @@ See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and pa
   - Animated voice orb (idle/recording/processing/speaking states)
   - Bluetooth headphone controls via react-native-track-player (native build only)
   - Background service via react-native-background-actions (native build only)
-- Context: `context/AssistantContext.tsx` — all state + voice flow logic
+  - Rolling audio buffer: continuous 30s segment recording keeping last 10 min on disk (`services/rollingBufferManager.ts`)
+  - Rolling buffer auto-pauses during manual voice recording to avoid mic conflicts
+  - Toggle in Settings screen ("Grabación continua") persisted via AsyncStorage
+  - EAS development build configured via `eas.json`
+- Context: `context/AssistantContext.tsx` — all state + voice flow logic + rolling buffer access
 
 ## Notes
 

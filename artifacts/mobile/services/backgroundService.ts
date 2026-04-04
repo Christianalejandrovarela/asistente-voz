@@ -1,4 +1,9 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { NativeModules, Platform } from "react-native";
+
+import { RollingBufferManager } from "@/services/rollingBufferManager";
+
+const ROLLING_BUFFER_KEY = "@rolling_buffer_active";
 
 export async function startBackgroundService(): Promise<boolean> {
   if (Platform.OS === "web") return false;
@@ -22,12 +27,15 @@ export async function startBackgroundService(): Promise<boolean> {
      * remain active for the lifetime of the user session (24/7 standby).
      */
     const backgroundTask = async () => {
+      await _restoreRollingBufferIfEnabled();
+
       await new Promise<void>((resolve) => {
         const keepAlive = setInterval(async () => {
           try {
             const running = await BackgroundService.isRunning();
             if (!running) {
               clearInterval(keepAlive);
+              await RollingBufferManager.stop();
               resolve();
             }
           } catch {
@@ -62,4 +70,15 @@ export async function stopBackgroundService(): Promise<void> {
     const BackgroundService = (await import("react-native-background-actions")).default;
     await BackgroundService.stop();
   } catch {}
+}
+
+async function _restoreRollingBufferIfEnabled(): Promise<void> {
+  try {
+    const stored = await AsyncStorage.getItem(ROLLING_BUFFER_KEY);
+    if (stored === "true") {
+      await RollingBufferManager.start();
+    }
+  } catch (err) {
+    console.warn("[BackgroundService] Failed to restore rolling buffer:", err);
+  }
 }
