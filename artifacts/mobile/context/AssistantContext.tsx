@@ -268,32 +268,46 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
   const playResponseAudio = async (base64Audio: string) => {
     try {
+      // Unload any previous sound first
       if (soundRef.current) {
-        await soundRef.current.unloadAsync();
+        try { await soundRef.current.stopAsync(); } catch {}
+        try { await soundRef.current.unloadAsync(); } catch {}
         soundRef.current = null;
       }
 
-      const tmpPath = `${FileSystem.cacheDirectory}ai_resp_${Date.now()}.mp3`;
+      // Use a fixed filename so we always overwrite — avoids accumulating
+      // temp files in the cache directory on Android.
+      const tmpPath = `${FileSystem.cacheDirectory ?? ""}ai_response.mp3`;
+
       await FileSystem.writeAsStringAsync(tmpPath, base64Audio, {
         encoding: "base64",
       });
 
+      // Switch audio session back to playback mode (critical after recording)
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: false,
         playsInSilentModeIOS: true,
         staysActiveInBackground: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
       });
 
-      const { sound } = await Audio.Sound.createAsync({ uri: tmpPath });
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: tmpPath },
+        { shouldPlay: true, volume: 1.0 }
+      );
       soundRef.current = sound;
 
+      // Wait for playback to finish
       await new Promise<void>((resolve) => {
         sound.setOnPlaybackStatusUpdate((playStatus) => {
-          if (playStatus.isLoaded && playStatus.didJustFinish) resolve();
+          if (playStatus.isLoaded && (playStatus.didJustFinish || !playStatus.isPlaying && playStatus.positionMillis > 0 && playStatus.durationMillis && playStatus.positionMillis >= playStatus.durationMillis)) {
+            resolve();
+          }
         });
-        void sound.playAsync();
       });
 
+      try { await sound.stopAsync(); } catch {}
       await sound.unloadAsync();
       soundRef.current = null;
     } catch (err) {
