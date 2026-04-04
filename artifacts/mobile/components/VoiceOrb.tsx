@@ -1,14 +1,5 @@
-import React, { useEffect } from "react";
-import { StyleSheet, View } from "react-native";
-import Animated, {
-  Easing,
-  cancelAnimation,
-  useAnimatedStyle,
-  useSharedValue,
-  withRepeat,
-  withSequence,
-  withTiming,
-} from "react-native-reanimated";
+import React, { useEffect, useRef } from "react";
+import { Animated, Easing, StyleSheet, View } from "react-native";
 import { useColors } from "@/hooks/useColors";
 import { AssistantStatus } from "@/context/AssistantContext";
 
@@ -19,156 +10,136 @@ interface VoiceOrbProps {
 
 export function VoiceOrb({ status, size = 160 }: VoiceOrbProps) {
   const colors = useColors();
-  const scale = useSharedValue(1);
-  const opacity = useSharedValue(1);
-  const ring1Scale = useSharedValue(1);
-  const ring1Opacity = useSharedValue(0);
-  const ring2Scale = useSharedValue(1);
-  const ring2Opacity = useSharedValue(0);
+
+  const scale = useRef(new Animated.Value(1)).current;
+  const opacity = useRef(new Animated.Value(1)).current;
+  const ring1Scale = useRef(new Animated.Value(1)).current;
+  const ring1Opacity = useRef(new Animated.Value(0)).current;
+  const ring2Scale = useRef(new Animated.Value(1)).current;
+  const ring2Opacity = useRef(new Animated.Value(0)).current;
+
+  const animsRef = useRef<Animated.CompositeAnimation[]>([]);
 
   useEffect(() => {
-    cancelAnimation(scale);
-    cancelAnimation(opacity);
-    cancelAnimation(ring1Scale);
-    cancelAnimation(ring1Opacity);
-    cancelAnimation(ring2Scale);
-    cancelAnimation(ring2Opacity);
+    animsRef.current.forEach((a) => a.stop());
+    animsRef.current = [];
 
     if (status === "idle") {
-      scale.value = withRepeat(
-        withSequence(
-          withTiming(1.03, { duration: 2000, easing: Easing.inOut(Easing.ease) }),
-          withTiming(0.97, { duration: 2000, easing: Easing.inOut(Easing.ease) })
-        ),
-        -1,
-        true
+      scale.setValue(1);
+      opacity.setValue(1);
+      ring1Opacity.setValue(0);
+      ring2Opacity.setValue(0);
+
+      const anim = Animated.loop(
+        Animated.sequence([
+          Animated.timing(scale, { toValue: 1.03, duration: 2000, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+          Animated.timing(scale, { toValue: 0.97, duration: 2000, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+        ])
       );
-      opacity.value = 1;
-      ring1Opacity.value = 0;
-      ring2Opacity.value = 0;
+      animsRef.current.push(anim);
+      anim.start();
     } else if (status === "recording") {
-      scale.value = withRepeat(
-        withSequence(
-          withTiming(1.08, { duration: 400, easing: Easing.out(Easing.ease) }),
-          withTiming(0.95, { duration: 400, easing: Easing.in(Easing.ease) })
-        ),
-        -1,
-        true
+      opacity.setValue(1);
+      const scaleAnim = Animated.loop(
+        Animated.sequence([
+          Animated.timing(scale, { toValue: 1.08, duration: 400, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+          Animated.timing(scale, { toValue: 0.95, duration: 400, easing: Easing.in(Easing.ease), useNativeDriver: true }),
+        ])
       );
-      ring1Scale.value = withRepeat(
-        withSequence(
-          withTiming(1.5, { duration: 800, easing: Easing.out(Easing.ease) }),
-          withTiming(1, { duration: 0 })
-        ),
-        -1
+      const r1s = Animated.loop(
+        Animated.sequence([
+          Animated.timing(ring1Scale, { toValue: 1.5, duration: 800, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+          Animated.timing(ring1Scale, { toValue: 1, duration: 0, useNativeDriver: true }),
+        ])
       );
-      ring1Opacity.value = withRepeat(
-        withSequence(
-          withTiming(0.4, { duration: 200 }),
-          withTiming(0, { duration: 600, easing: Easing.out(Easing.ease) })
-        ),
-        -1
+      const r1o = Animated.loop(
+        Animated.sequence([
+          Animated.timing(ring1Opacity, { toValue: 0.4, duration: 200, useNativeDriver: true }),
+          Animated.timing(ring1Opacity, { toValue: 0, duration: 600, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+        ])
       );
-      ring2Scale.value = withRepeat(
-        withSequence(
-          withTiming(1, { duration: 400 }),
-          withTiming(1.8, { duration: 800, easing: Easing.out(Easing.ease) }),
-          withTiming(1, { duration: 0 })
-        ),
-        -1
+      const r2s = Animated.loop(
+        Animated.sequence([
+          Animated.timing(ring2Scale, { toValue: 1, duration: 400, useNativeDriver: true }),
+          Animated.timing(ring2Scale, { toValue: 1.8, duration: 800, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+          Animated.timing(ring2Scale, { toValue: 1, duration: 0, useNativeDriver: true }),
+        ])
       );
-      ring2Opacity.value = withRepeat(
-        withSequence(
-          withTiming(0, { duration: 400 }),
-          withTiming(0.25, { duration: 200 }),
-          withTiming(0, { duration: 600, easing: Easing.out(Easing.ease) })
-        ),
-        -1
+      const r2o = Animated.loop(
+        Animated.sequence([
+          Animated.timing(ring2Opacity, { toValue: 0, duration: 400, useNativeDriver: true }),
+          Animated.timing(ring2Opacity, { toValue: 0.25, duration: 200, useNativeDriver: true }),
+          Animated.timing(ring2Opacity, { toValue: 0, duration: 600, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+        ])
       );
+      animsRef.current.push(scaleAnim, r1s, r1o, r2s, r2o);
+      [scaleAnim, r1s, r1o, r2s, r2o].forEach((a) => a.start());
     } else if (status === "processing") {
-      scale.value = withRepeat(
-        withSequence(
-          withTiming(1.05, { duration: 600, easing: Easing.inOut(Easing.ease) }),
-          withTiming(0.95, { duration: 600, easing: Easing.inOut(Easing.ease) })
-        ),
-        -1,
-        true
+      ring1Opacity.setValue(0);
+      ring2Opacity.setValue(0);
+      const scaleAnim = Animated.loop(
+        Animated.sequence([
+          Animated.timing(scale, { toValue: 1.05, duration: 600, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+          Animated.timing(scale, { toValue: 0.95, duration: 600, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+        ])
       );
-      opacity.value = withRepeat(
-        withSequence(
-          withTiming(0.7, { duration: 600 }),
-          withTiming(1, { duration: 600 })
-        ),
-        -1,
-        true
+      const opacityAnim = Animated.loop(
+        Animated.sequence([
+          Animated.timing(opacity, { toValue: 0.7, duration: 600, useNativeDriver: true }),
+          Animated.timing(opacity, { toValue: 1, duration: 600, useNativeDriver: true }),
+        ])
       );
-      ring1Opacity.value = 0;
-      ring2Opacity.value = 0;
+      animsRef.current.push(scaleAnim, opacityAnim);
+      scaleAnim.start();
+      opacityAnim.start();
     } else if (status === "speaking") {
-      scale.value = withRepeat(
-        withSequence(
-          withTiming(1.1, { duration: 300, easing: Easing.out(Easing.ease) }),
-          withTiming(0.98, { duration: 300, easing: Easing.in(Easing.ease) })
-        ),
-        -1,
-        true
+      opacity.setValue(1);
+      const scaleAnim = Animated.loop(
+        Animated.sequence([
+          Animated.timing(scale, { toValue: 1.1, duration: 300, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+          Animated.timing(scale, { toValue: 0.98, duration: 300, easing: Easing.in(Easing.ease), useNativeDriver: true }),
+        ])
       );
-      ring1Scale.value = withRepeat(
-        withSequence(
-          withTiming(1.6, { duration: 600, easing: Easing.out(Easing.ease) }),
-          withTiming(1, { duration: 0 })
-        ),
-        -1
+      const r1s = Animated.loop(
+        Animated.sequence([
+          Animated.timing(ring1Scale, { toValue: 1.6, duration: 600, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+          Animated.timing(ring1Scale, { toValue: 1, duration: 0, useNativeDriver: true }),
+        ])
       );
-      ring1Opacity.value = withRepeat(
-        withSequence(
-          withTiming(0.3, { duration: 100 }),
-          withTiming(0, { duration: 500, easing: Easing.out(Easing.ease) })
-        ),
-        -1
+      const r1o = Animated.loop(
+        Animated.sequence([
+          Animated.timing(ring1Opacity, { toValue: 0.3, duration: 100, useNativeDriver: true }),
+          Animated.timing(ring1Opacity, { toValue: 0, duration: 500, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+        ])
       );
-      ring2Scale.value = withRepeat(
-        withSequence(
-          withTiming(2.2, { duration: 900, easing: Easing.out(Easing.ease) }),
-          withTiming(1, { duration: 0 })
-        ),
-        -1
+      const r2s = Animated.loop(
+        Animated.sequence([
+          Animated.timing(ring2Scale, { toValue: 2.2, duration: 900, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+          Animated.timing(ring2Scale, { toValue: 1, duration: 0, useNativeDriver: true }),
+        ])
       );
-      ring2Opacity.value = withRepeat(
-        withSequence(
-          withTiming(0.15, { duration: 150 }),
-          withTiming(0, { duration: 750, easing: Easing.out(Easing.ease) })
-        ),
-        -1
+      const r2o = Animated.loop(
+        Animated.sequence([
+          Animated.timing(ring2Opacity, { toValue: 0.15, duration: 150, useNativeDriver: true }),
+          Animated.timing(ring2Opacity, { toValue: 0, duration: 750, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+        ])
       );
+      animsRef.current.push(scaleAnim, r1s, r1o, r2s, r2o);
+      [scaleAnim, r1s, r1o, r2s, r2o].forEach((a) => a.start());
     }
+
+    return () => {
+      animsRef.current.forEach((a) => a.stop());
+      animsRef.current = [];
+    };
   }, [status]);
-
-  const orbStyle = useAnimatedStyle(() => ({
-    transform: [{ scale: scale.value }],
-    opacity: opacity.value,
-  }));
-
-  const ring1Style = useAnimatedStyle(() => ({
-    transform: [{ scale: ring1Scale.value }],
-    opacity: ring1Opacity.value,
-  }));
-
-  const ring2Style = useAnimatedStyle(() => ({
-    transform: [{ scale: ring2Scale.value }],
-    opacity: ring2Opacity.value,
-  }));
 
   const getOrbColor = () => {
     switch (status) {
-      case "recording":
-        return "#ef4444";
-      case "processing":
-        return "#f59e0b";
-      case "speaking":
-        return "#10b981";
-      default:
-        return colors.primary;
+      case "recording": return "#ef4444";
+      case "processing": return "#f59e0b";
+      case "speaking": return "#10b981";
+      default: return colors.primary;
     }
   };
 
@@ -184,8 +155,9 @@ export function VoiceOrb({ status, size = 160 }: VoiceOrbProps) {
             height: size,
             borderRadius: size / 2,
             backgroundColor: orbColor,
+            transform: [{ scale: ring2Scale }],
+            opacity: ring2Opacity,
           },
-          ring2Style,
         ]}
       />
       <Animated.View
@@ -196,8 +168,9 @@ export function VoiceOrb({ status, size = 160 }: VoiceOrbProps) {
             height: size,
             borderRadius: size / 2,
             backgroundColor: orbColor,
+            transform: [{ scale: ring1Scale }],
+            opacity: ring1Opacity,
           },
-          ring1Style,
         ]}
       />
       <Animated.View
@@ -209,8 +182,9 @@ export function VoiceOrb({ status, size = 160 }: VoiceOrbProps) {
             borderRadius: size / 2,
             backgroundColor: orbColor,
             shadowColor: orbColor,
+            transform: [{ scale }],
+            opacity,
           },
-          orbStyle,
         ]}
       >
         <View

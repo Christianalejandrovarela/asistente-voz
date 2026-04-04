@@ -9,16 +9,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Stack } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import React, { useEffect } from "react";
-import { GestureHandlerRootView } from "react-native-gesture-handler";
-import { KeyboardProvider } from "react-native-keyboard-controller";
+import { View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { AssistantProvider } from "@/context/AssistantContext";
 
-// Platform-specific side-effect import:
-// • On iOS/Android → services/initTrackPlayer.native.ts  (registers RNTP service)
-// • On web         → services/initTrackPlayer.ts          (empty stub)
 import "@/services/initTrackPlayer";
 
 SplashScreen.preventAutoHideAsync();
@@ -60,13 +56,11 @@ export default function RootLayout() {
     <SafeAreaProvider>
       <ErrorBoundary>
         <QueryClientProvider client={queryClient}>
-          <GestureHandlerRootView style={{ flex: 1 }}>
-            <KeyboardProvider>
-              <AssistantProvider>
-                <RootLayoutNav />
-              </AssistantProvider>
-            </KeyboardProvider>
-          </GestureHandlerRootView>
+          <View style={{ flex: 1 }}>
+            <AssistantProvider>
+              <RootLayoutNav />
+            </AssistantProvider>
+          </View>
         </QueryClientProvider>
       </ErrorBoundary>
     </SafeAreaProvider>
