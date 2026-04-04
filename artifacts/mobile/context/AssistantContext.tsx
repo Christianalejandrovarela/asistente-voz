@@ -45,6 +45,7 @@ interface AssistantContextValue {
   debugInfo: string;
   startSession: () => Promise<void>;
   stopSession: () => Promise<void>;
+  interruptSpeaking: () => Promise<void>;
   clearHistory: () => void;
   updateSettings: (settings: Partial<AssistantSettings>) => void;
   toggleRollingBuffer: (enabled: boolean) => Promise<void>;
@@ -100,9 +101,13 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const maxRecordingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settingsRef = useRef<AssistantSettings>(DEFAULT_SETTINGS);
 
-  useEffect(() => {
-    statusRef.current = status;
-  }, [status]);
+  // Sync setter: updates the ref immediately (same tick) so guards that read
+  // statusRef.current right after a setStatus call see the new value at once,
+  // without waiting for React to flush the re-render.
+  const setStatusSync = (s: AssistantStatus) => {
+    statusRef.current = s;
+    setStatus(s);
+  };
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -242,7 +247,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       );
 
       recordingRef.current = recording;
-      setStatus("recording");
+      setStatusSync("recording");
 
       let hasSpeech = false;
       let silenceStart: number | null = null;
@@ -285,7 +290,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       }, MAX_RECORDING_MS);
     } catch (err) {
       console.error("[VoiceAssistant] Error starting listening:", err);
-      setStatus("idle");
+      setStatusSync("idle");
       await RollingBufferManager.resume();
       await resumeSilentTrack();
       if (isSessionActiveRef.current) {
@@ -297,7 +302,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const sendCurrentRecordingFn = async () => {
     clearMaxTimer();
     if (statusRef.current !== "recording" || !recordingRef.current) return;
-    setStatus("processing");
+    setStatusSync("processing");
 
     try {
       const recording = recordingRef.current;
@@ -310,7 +315,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       const base64Audio = await readUriAsBase64(uri);
 
       if (!isSessionActiveRef.current) {
-        setStatus("idle");
+        setStatusSync("idle");
         await RollingBufferManager.resume();
         await resumeSilentTrack();
         return;
@@ -354,7 +359,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       abortControllerRef.current = null;
 
       if (!isSessionActiveRef.current) {
-        setStatus("idle");
+        setStatusSync("idle");
         await RollingBufferManager.resume();
         await resumeSilentTrack();
         return;
@@ -373,20 +378,20 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       ]);
 
       if (!isSessionActiveRef.current) {
-        setStatus("idle");
+        setStatusSync("idle");
         await RollingBufferManager.resume();
         await resumeSilentTrack();
         return;
       }
 
-      setStatus("speaking");
+      setStatusSync("speaking");
       await playResponseAudio(data.audio);
 
       if (isSessionActiveRef.current) {
-        setStatus("idle");
+        setStatusSync("idle");
         void startListeningFn();
       } else {
-        setStatus("idle");
+        setStatusSync("idle");
         await RollingBufferManager.resume();
         await resumeSilentTrack();
       }
@@ -397,7 +402,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         const message = err instanceof Error ? err.message : "Error desconocido";
         Alert.alert("Error", `No se pudo procesar: ${message}`, [{ text: "OK" }]);
       }
-      setStatus("idle");
+      setStatusSync("idle");
       await RollingBufferManager.resume();
       await resumeSilentTrack();
       if (isSessionActiveRef.current && !isAbort) {
@@ -441,7 +446,25 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
     await RollingBufferManager.resume();
     await resumeSilentTrack();
-    setStatus("idle");
+    setStatusSync("idle");
+  };
+
+  // Ref to resolve the playback promise from outside (used by interruptSpeaking)
+  const playbackResolveRef = useRef<(() => void) | null>(null);
+
+  const interruptSpeakingFn = async () => {
+    if (statusRef.current !== "speaking") return;
+    // Resolve the awaited playback promise first so sendCurrentRecordingFn can continue
+    playbackResolveRef.current?.();
+    playbackResolveRef.current = null;
+    // Stop audio immediately
+    if (soundRef.current) {
+      try { await soundRef.current.stopAsync(); } catch {}
+      try { await soundRef.current.unloadAsync(); } catch {}
+      soundRef.current = null;
+    }
+    // startListeningFn will be called by sendCurrentRecordingFn once the
+    // playResponseAudio promise resolves (which we just triggered above)
   };
 
   const playResponseAudio = async (base64Audio: string) => {
@@ -469,7 +492,10 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       // argument to createAsync. This prevents the race condition where
       // didJustFinish fires before setOnPlaybackStatusUpdate is called.
       let resolvePlayback!: () => void;
-      const playbackDone = new Promise<void>((res) => { resolvePlayback = res; });
+      const playbackDone = new Promise<void>((res) => {
+        resolvePlayback = res;
+        playbackResolveRef.current = res; // expose so interruptSpeaking can resolve it
+      });
 
       const { sound } = await Audio.Sound.createAsync(
         { uri: tmpPath },
@@ -493,8 +519,9 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       const safetyTimeout = new Promise<void>((res) => setTimeout(res, 3 * 60 * 1000));
       await Promise.race([playbackDone, safetyTimeout]);
 
+      playbackResolveRef.current = null; // clear after done
       try { await sound.stopAsync(); } catch {}
-      await sound.unloadAsync();
+      try { await sound.unloadAsync(); } catch {}
       soundRef.current = null;
     } catch (err) {
       console.error("[VoiceAssistant] Error playing audio:", err);
@@ -513,6 +540,11 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
   const stopSession = useCallback(async () => {
     await stopSessionFn();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const interruptSpeaking = useCallback(async () => {
+    await interruptSpeakingFn();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -566,6 +598,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         debugInfo,
         startSession,
         stopSession,
+        interruptSpeaking,
         clearHistory,
         updateSettings,
         toggleRollingBuffer,

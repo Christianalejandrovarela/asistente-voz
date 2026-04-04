@@ -27,18 +27,22 @@ const STATUS_LABELS: Record<AssistantStatus, string> = {
 export default function MainScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { status, isSessionActive, messages, isBluetoothActive, debugInfo, startSession, stopSession } = useAssistant();
+  const { status, isSessionActive, messages, isBluetoothActive, debugInfo, startSession, stopSession, interruptSpeaking } = useAssistant();
   const listRef = useRef<FlatList>(null);
 
   const handleOrbPress = useCallback(async () => {
     if (!isSessionActive) {
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
       await startSession();
+    } else if (status === "speaking") {
+      // Interrupt the AI mid-response and start listening immediately
+      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      await interruptSpeaking();
     } else {
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       await stopSession();
     }
-  }, [isSessionActive, startSession, stopSession]);
+  }, [isSessionActive, status, startSession, stopSession, interruptSpeaking]);
 
   const webTopPad = Platform.OS === "web" ? 67 : 0;
   const webBotPad = Platform.OS === "web" ? 34 : 0;
@@ -53,7 +57,11 @@ export default function MainScreen() {
     ? STATUS_LABELS[status]
     : "Toca para comenzar";
 
-  const hintText = isSessionActive ? "Toca para terminar" : " ";
+  const hintText = !isSessionActive
+    ? " "
+    : status === "speaking"
+    ? "Toca para interrumpir"
+    : "Toca para terminar";
 
   return (
     <View
