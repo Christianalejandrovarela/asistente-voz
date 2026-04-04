@@ -144,11 +144,16 @@ export async function voiceChat(
   voice: "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer" = "alloy",
   inputFormat: "wav" | "mp3" = "wav",
   outputFormat: "wav" | "mp3" = "mp3",
-  history: ConversationHistoryEntry[] = []
+  history: ConversationHistoryEntry[] = [],
+  systemPrompt?: string
 ): Promise<{ transcript: string; audioResponse: Buffer }> {
   const audioBase64 = audioBuffer.toString("base64");
 
   type ChatMessage = Parameters<typeof openai.chat.completions.create>[0]["messages"][number];
+
+  const systemMessages: ChatMessage[] = systemPrompt
+    ? [{ role: "system", content: systemPrompt }]
+    : [];
 
   const historyMessages: ChatMessage[] = history.map((entry) => ({
     role: entry.role,
@@ -160,6 +165,7 @@ export async function voiceChat(
     modalities: ["text", "audio"],
     audio: { voice, format: outputFormat },
     messages: [
+      ...systemMessages,
       ...historyMessages,
       {
         role: "user",

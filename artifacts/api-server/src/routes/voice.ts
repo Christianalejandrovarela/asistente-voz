@@ -78,7 +78,14 @@ router.post("/voice/chat", async (req: Request, res: Response) => {
 
     const [userText, { transcript: assistantText, audioResponse }] = await Promise.all([
       speechToText(buffer, format, language),
-      voiceChat(buffer, selectedVoice, format, "mp3", safeHistory),
+      voiceChat(
+        buffer,
+        selectedVoice,
+        format,
+        "mp3",
+        safeHistory,
+        "Eres un asistente de voz útil y amigable. Siempre responde en español, sin importar el idioma en que te hablen."
+      ),
     ]);
 
     res.json({
