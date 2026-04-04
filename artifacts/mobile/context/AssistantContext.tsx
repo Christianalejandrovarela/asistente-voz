@@ -1,12 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Audio } from "expo-av";
 import * as FileSystem from "expo-file-system/legacy";
-import {
-  useAudioRecorder,
-  RecordingPresets,
-  requestRecordingPermissionsAsync,
-  setAudioModeAsync,
-} from "expo-audio";
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Alert, Platform } from "react-native";
 
@@ -55,6 +49,11 @@ function generateId(): string {
   return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
 }
 
+/**
+ * Converts a recording URI to base64.
+ * • On web, expo-av returns a blob: URL — we use fetch + FileReader.
+ * • On native, it returns a file:// path — expo-file-system handles it.
+ */
 async function readUriAsBase64(uri: string): Promise<string> {
   if (Platform.OS === "web" || uri.startsWith("blob:")) {
     const resp = await fetch(uri);
@@ -77,7 +76,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [settings, setSettings] = useState<AssistantSettings>(DEFAULT_SETTINGS);
   const [isBluetoothActive, setIsBluetoothActive] = useState(false);
-  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
   const statusRef = useRef<AssistantStatus>("idle");
 
@@ -89,6 +88,15 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     void loadStoredData();
   }, []);
 
+  /**
+   * Bluetooth listener setup lives at the provider level so it remains active
+   * for the full app lifetime — even when the main screen is unmounted or the
+   * app moves to the background (JS thread stays alive via the audio session
+   * and the background foreground-service).
+   *
+   * A stable ref is used so the callback always reads the latest status
+   * without re-registering listeners when status changes.
+   */
   const handleRemoteToggleRef = useRef<() => void>(() => {});
   useEffect(() => {
     handleRemoteToggleRef.current = () => {
@@ -132,18 +140,15 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   };
 
   const addMessages = useCallback((newMsgs: ChatMessage[]) => {
-    setMessages((prev) => {
-      const updated = [...prev, ...newMsgs];
-      return updated;
-    });
+    setMessages((prev) => [...prev, ...newMsgs]);
     void Promise.all(newMsgs.map((m) => addMessage(m)));
   }, []);
 
   const startRecordingFn = async () => {
     if (statusRef.current !== "idle") return;
     try {
-      const { granted } = await requestRecordingPermissionsAsync();
-      if (!granted) {
+      const { status: permStatus } = await Audio.requestPermissionsAsync();
+      if (permStatus !== "granted") {
         console.warn("[VoiceAssistant] Microphone permission denied");
         Alert.alert(
           "Permiso de micrófono",
@@ -153,13 +158,15 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      await setAudioModeAsync({
-        allowsRecording: true,
-        playsInSilentMode: true,
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
       });
 
-      await recorder.prepareToRecordAsync();
-      recorder.record();
+      const { recording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY
+      );
+      recordingRef.current = recording;
       setStatus("recording");
     } catch (err) {
       console.error("[VoiceAssistant] Error starting recording:", err);
@@ -168,12 +175,14 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   };
 
   const stopRecordingFn = async () => {
-    if (statusRef.current !== "recording") return;
+    if (statusRef.current !== "recording" || !recordingRef.current) return;
     setStatus("processing");
 
     try {
-      await recorder.stop();
-      const uri = recorder.uri;
+      const recording = recordingRef.current;
+      await recording.stopAndUnloadAsync();
+      const uri = recording.getURI();
+      recordingRef.current = null;
 
       if (!uri) throw new Error("No recording URI available");
 
@@ -185,7 +194,6 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         : "http://localhost:8080/api/voice/chat";
 
       const currentSettings = settings;
-
       const recentHistory = await getMessages(20);
       const historyPayload = recentHistory.map((m) => ({ role: m.role, text: m.text }));
 
@@ -265,7 +273,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       await sound.unloadAsync();
       soundRef.current = null;
     } catch (err) {
-      console.error("Error playing audio response:", err);
+      console.error("[VoiceAssistant] Error playing audio response:", err);
     }
   };
 
