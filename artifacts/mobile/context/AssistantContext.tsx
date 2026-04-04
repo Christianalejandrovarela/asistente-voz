@@ -138,6 +138,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         const [tpResult] = await Promise.all([
           setupTrackPlayer(
             () => { handleRemoteToggleRef.current(); },
+            () => { handleRemoteToggleRef.current(); },
             () => { handleRemoteToggleRef.current(); }
           ),
           startBackgroundService(),
@@ -183,7 +184,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     await RollingBufferManager.stop();
     setIsRollingBufferActive(false);
     await AsyncStorage.setItem(ROLLING_BUFFER_KEY, "false");
-    await stopBackgroundService();
+    // Keep background service running so headphone button still works after disconnect
     setIsBluetoothActive(false);
   };
 

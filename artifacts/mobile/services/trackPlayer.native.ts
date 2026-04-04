@@ -6,6 +6,7 @@ const NATIVE_MODULE_NAME = "TrackPlayerModule";
 let isInitialized = false;
 let unsubPlay: (() => void) | null = null;
 let unsubPause: (() => void) | null = null;
+let unsubToggle: (() => void) | null = null;
 
 function hasNativeModule(): boolean {
   return !!NativeModules[NATIVE_MODULE_NAME];
@@ -66,10 +67,11 @@ function generateSilentWavBase64(): string {
 
 export async function setupTrackPlayer(
   onPlay: () => void,
-  onPause: () => void
+  onPause: () => void,
+  onToggle?: () => void
 ): Promise<boolean> {
   if (!hasNativeModule()) {
-    console.log("[TrackPlayer] Native module not available. Available modules:", Object.keys(NativeModules).filter(k => k.toLowerCase().includes("track") || k.toLowerCase().includes("music")).join(", ") || "none matching");
+    console.log("[TrackPlayer] Native module not available.");
     return false;
   }
 
@@ -80,7 +82,13 @@ export async function setupTrackPlayer(
       console.log("[TrackPlayer] Setting up player...");
       await TrackPlayer.setupPlayer();
       await TrackPlayer.updateOptions({
-        capabilities: [Capability.Play, Capability.Pause],
+        // Include Next/Previous so headsets that send those events are captured
+        capabilities: [
+          Capability.Play,
+          Capability.Pause,
+          Capability.SkipToNext,
+          Capability.SkipToPrevious,
+        ],
         compactCapabilities: [Capability.Play, Capability.Pause],
         notificationCapabilities: [Capability.Play, Capability.Pause],
       });
@@ -90,20 +98,16 @@ export async function setupTrackPlayer(
       await FileSystem.writeAsStringAsync(silencePath, silenceBase64, {
         encoding: FileSystem.EncodingType.Base64,
       });
-      console.log("[TrackPlayer] Silent WAV written to:", silencePath);
 
       await TrackPlayer.add({
         id: "silence",
         url: silencePath,
         title: "Asistente de Voz IA",
-        artist: "Listo para escuchar",
+        artist: "Presiona el botón del auricular para activar",
         duration: 2,
       });
       await TrackPlayer.setRepeatMode(RepeatMode.Track);
       await TrackPlayer.play();
-
-      const playbackState = await TrackPlayer.getPlaybackState();
-      console.log("[TrackPlayer] Playback state after play:", playbackState.state);
 
       isInitialized = true;
       console.log("[TrackPlayer] Initialized, media session active");
@@ -111,6 +115,7 @@ export async function setupTrackPlayer(
 
     if (unsubPlay) unsubPlay();
     if (unsubPause) unsubPause();
+    if (unsubToggle) unsubToggle();
 
     const playSubscription = TrackPlayer.addEventListener(Event.RemotePlay, () => {
       console.log("[TrackPlayer] EVENT: RemotePlay received from headset");
@@ -123,6 +128,11 @@ export async function setupTrackPlayer(
 
     unsubPlay = () => playSubscription.remove();
     unsubPause = () => pauseSubscription.remove();
+
+    if (onToggle) {
+      const { onRemoteToggle } = await import("./trackPlayerEvents");
+      unsubToggle = onRemoteToggle(onToggle);
+    }
 
     return true;
   } catch (err) {
@@ -153,6 +163,7 @@ export async function destroyTrackPlayer(): Promise<void> {
   try {
     if (unsubPlay) { unsubPlay(); unsubPlay = null; }
     if (unsubPause) { unsubPause(); unsubPause = null; }
+    if (unsubToggle) { unsubToggle(); unsubToggle = null; }
     const { default: TrackPlayer } = await import("react-native-track-player");
     await TrackPlayer.reset();
     isInitialized = false;

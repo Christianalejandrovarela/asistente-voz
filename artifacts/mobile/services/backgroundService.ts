@@ -49,7 +49,7 @@ export async function startBackgroundService(): Promise<boolean> {
     await BackgroundService.start(backgroundTask, {
       taskName: "VoiceAssistant",
       taskTitle: "Asistente de Voz IA",
-      taskDesc: "El asistente está listo para escucharte",
+      taskDesc: "Presiona el botón del auricular para activar",
       taskIcon: {
         name: "ic_launcher",
         type: "mipmap",
