@@ -8,6 +8,7 @@ import {
   setAudioModeAsync,
 } from "expo-audio";
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { Alert, Platform } from "react-native";
 
 import { setupTrackPlayer, destroyTrackPlayer } from "@/services/trackPlayer";
 import { startBackgroundService } from "@/services/backgroundService";
@@ -52,6 +53,23 @@ const DEFAULT_SETTINGS: AssistantSettings = { voice: "nova", language: "es" };
 
 function generateId(): string {
   return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+}
+
+async function readUriAsBase64(uri: string): Promise<string> {
+  if (Platform.OS === "web" || uri.startsWith("blob:")) {
+    const resp = await fetch(uri);
+    const blob = await resp.blob();
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const result = reader.result as string;
+        resolve(result.split(",")[1]);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+  return FileSystem.readAsStringAsync(uri, { encoding: "base64" });
 }
 
 export function AssistantProvider({ children }: { children: React.ReactNode }) {
@@ -125,7 +143,15 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     if (statusRef.current !== "idle") return;
     try {
       const { granted } = await requestRecordingPermissionsAsync();
-      if (!granted) return;
+      if (!granted) {
+        console.warn("[VoiceAssistant] Microphone permission denied");
+        Alert.alert(
+          "Permiso de micrófono",
+          "Para usar el asistente necesitas conceder acceso al micrófono en los ajustes de tu dispositivo.",
+          [{ text: "OK" }]
+        );
+        return;
+      }
 
       await setAudioModeAsync({
         allowsRecording: true,
@@ -136,7 +162,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       recorder.record();
       setStatus("recording");
     } catch (err) {
-      console.error("Error starting recording:", err);
+      console.error("[VoiceAssistant] Error starting recording:", err);
       setStatus("idle");
     }
   };
@@ -151,9 +177,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
       if (!uri) throw new Error("No recording URI available");
 
-      const base64Audio = await FileSystem.readAsStringAsync(uri, {
-        encoding: "base64",
-      });
+      const base64Audio = await readUriAsBase64(uri);
 
       const domain = process.env.EXPO_PUBLIC_DOMAIN;
       const apiUrl = domain
@@ -193,7 +217,9 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       await playResponseAudio(data.audio);
       setStatus("idle");
     } catch (err) {
-      console.error("Error processing voice:", err);
+      console.error("[VoiceAssistant] Error processing voice:", err);
+      const message = err instanceof Error ? err.message : "Error desconocido";
+      Alert.alert("Error de voz", `No se pudo procesar el audio: ${message}`, [{ text: "OK" }]);
       setStatus("idle");
     }
   };
