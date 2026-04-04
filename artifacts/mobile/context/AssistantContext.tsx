@@ -480,21 +480,21 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       tmpPath = `${FileSystem.cacheDirectory ?? ""}ai_resp_${Date.now()}.mp3`;
       await FileSystem.writeAsStringAsync(tmpPath, base64Audio, { encoding: "base64" });
 
+      // allowsRecordingIOS:true enables simultaneous mic monitoring (barge-in)
       await Audio.setAudioModeAsync({
-        allowsRecordingIOS: false,
+        allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
         staysActiveInBackground: true,
         shouldDuckAndroid: true,
         playThroughEarpieceAndroid: false,
       });
 
-      // Register the callback BEFORE playback starts by passing it as the 3rd
-      // argument to createAsync. This prevents the race condition where
-      // didJustFinish fires before setOnPlaybackStatusUpdate is called.
+      // Register the playback callback BEFORE createAsync so didJustFinish is
+      // never missed due to a race condition.
       let resolvePlayback!: () => void;
       const playbackDone = new Promise<void>((res) => {
         resolvePlayback = res;
-        playbackResolveRef.current = res; // expose so interruptSpeaking can resolve it
+        playbackResolveRef.current = res;
       });
 
       const { sound } = await Audio.Sound.createAsync(
@@ -515,11 +515,50 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       );
       soundRef.current = sound;
 
+      // ── Barge-in: monitor mic while AI speaks ──────────────────────────────
+      // If the user starts talking, we interrupt the AI immediately.
+      let bargeInRec: Audio.Recording | null = null;
+      try {
+        const { recording } = await Audio.Recording.createAsync(
+          { ...Audio.RecordingOptionsPresets.HIGH_QUALITY, isMeteringEnabled: true },
+          undefined,
+          80 // poll every 80 ms
+        );
+        bargeInRec = recording;
+        let speechStart: number | null = null;
+
+        recording.setOnRecordingStatusUpdate((s) => {
+          if (!s.isRecording || !isSessionActiveRef.current) return;
+          const db = s.metering ?? -160;
+          if (db > VAD_SILENCE_THRESHOLD_DB) {
+            if (!speechStart) speechStart = Date.now();
+            // Require at least MIN_SPEECH_MS of sustained voice before triggering
+            if (Date.now() - speechStart >= VAD_MIN_SPEECH_MS) {
+              recording.setOnRecordingStatusUpdate(null);
+              resolvePlayback(); // interrupt playback
+            }
+          } else {
+            speechStart = null; // reset on silence
+          }
+        });
+      } catch {
+        // Barge-in unavailable (permissions, device limit) — continue without it
+      }
+
       // Safety-net timeout: if playback status never fires, unblock after 3 min
       const safetyTimeout = new Promise<void>((res) => setTimeout(res, 3 * 60 * 1000));
       await Promise.race([playbackDone, safetyTimeout]);
 
-      playbackResolveRef.current = null; // clear after done
+      // Stop barge-in monitor
+      if (bargeInRec) {
+        try {
+          bargeInRec.setOnRecordingStatusUpdate(null);
+          await bargeInRec.stopAndUnloadAsync();
+        } catch {}
+        bargeInRec = null;
+      }
+
+      playbackResolveRef.current = null;
       try { await sound.stopAsync(); } catch {}
       try { await sound.unloadAsync(); } catch {}
       soundRef.current = null;

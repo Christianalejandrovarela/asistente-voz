@@ -60,7 +60,7 @@ export default function MainScreen() {
   const hintText = !isSessionActive
     ? " "
     : status === "speaking"
-    ? "Toca para interrumpir"
+    ? "Habla o toca para interrumpir"
     : "Toca para terminar";
 
   return (
