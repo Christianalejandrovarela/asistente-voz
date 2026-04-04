@@ -7,7 +7,7 @@
     "icon": "./assets/images/icon.png",
     "scheme": "mobile",
     "userInterfaceStyle": "dark",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "splash": {
       "image": "./assets/images/icon.png",
       "resizeMode": "contain",
@@ -17,7 +17,11 @@
       "supportsTablet": false,
       "infoPlist": {
         "NSMicrophoneUsageDescription": "Necesitamos el micrófono para que puedas hablar con el asistente de voz IA.",
-        "UIBackgroundModes": ["audio", "fetch", "remote-notification"]
+        "UIBackgroundModes": [
+          "audio",
+          "fetch",
+          "remote-notification"
+        ]
       }
     },
     "android": {
@@ -27,7 +31,9 @@
         "FOREGROUND_SERVICE",
         "FOREGROUND_SERVICE_MICROPHONE",
         "WAKE_LOCK",
-        "RECEIVE_BOOT_COMPLETED"
+        "RECEIVE_BOOT_COMPLETED",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
       ]
     },
     "web": {
@@ -48,17 +54,16 @@
           "microphonePermission": "Necesitamos el micrófono para que puedas hablar con el asistente de voz IA."
         }
       ],
-      [
-        "expo-audio",
-        {
-          "microphonePermission": "Necesitamos el micrófono para que puedas hablar con el asistente de voz IA."
-        }
-      ],
       "./plugins/withReactNativeTrackPlayer"
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "eas": {
+        "projectId": "5eb406b7-90e5-421f-a69e-a849f2026761"
+      }
     }
   }
 }
