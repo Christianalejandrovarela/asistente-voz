@@ -18,7 +18,7 @@ import { AssistantStatus, ChatMessage, useAssistant } from "@/context/AssistantC
 import { useColors } from "@/hooks/useColors";
 
 const STATUS_LABELS: Record<AssistantStatus, string> = {
-  idle: "Iniciando...",
+  idle: "Listo",
   waiting: "¿Algo más?",
   recording: "Escuchando...",
   processing: "Pensando...",

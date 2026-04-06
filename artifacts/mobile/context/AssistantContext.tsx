@@ -111,6 +111,9 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   // Compressed summary of previous conversation turns.
   // Persisted to AsyncStorage; sent with each API request so context survives session restarts.
   const contextSummaryRef = useRef<string>("");
+  // Count consecutive mic-start failures to stop the retry loop after MAX_MIC_RETRIES
+  const micRetryCountRef = useRef(0);
+  const MAX_MIC_RETRIES = 3;
 
   // Sync setter: updates the ref immediately (same tick) so guards that read
   // statusRef.current right after a setStatus call see the new value at once,
@@ -263,9 +266,12 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
-        staysActiveInBackground: true,
-        shouldDuckAndroid: false,
-        playThroughEarpieceAndroid: false,
+        // Android-specific — skip on web to avoid unsupported-option errors
+        ...(Platform.OS === "android" ? {
+          staysActiveInBackground: true,
+          shouldDuckAndroid: false,
+          playThroughEarpieceAndroid: false,
+        } : {}),
       });
 
       const { recording } = await Audio.Recording.createAsync(
@@ -278,6 +284,8 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       );
 
       recordingRef.current = recording;
+      // Success — reset the failure counter
+      micRetryCountRef.current = 0;
       // Follow-up mode: show "waiting" until the user starts speaking.
       // Normal mode: show "recording" immediately.
       setStatusSync(isFollowUp ? "waiting" : "recording");
@@ -344,12 +352,25 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     } catch (err) {
       const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
       console.error("[VoiceAssistant] Error starting listening:", msg);
-      setDebugInfo(`Error mic: ${msg}`);
+      micRetryCountRef.current += 1;
+      setDebugInfo(`Error mic (${micRetryCountRef.current}/${MAX_MIC_RETRIES}): ${msg}`);
       setStatusSync("idle");
       await RollingBufferManager.resume();
       await resumeSilentTrack();
       if (isSessionActiveRef.current) {
-        setTimeout(() => { void startListeningFn(); }, 1000);
+        if (micRetryCountRef.current < MAX_MIC_RETRIES) {
+          // Retry with backoff
+          setTimeout(() => { void startListeningFn(); }, 1000 * micRetryCountRef.current);
+        } else {
+          // Give up — stop session and show the error clearly
+          console.error("[VoiceAssistant] Max mic retries reached — stopping session");
+          Alert.alert(
+            "Error de micrófono",
+            `No se pudo iniciar el micrófono después de ${MAX_MIC_RETRIES} intentos.\n\n${msg}`,
+            [{ text: "OK" }]
+          );
+          void stopSessionFn();
+        }
       }
     }
   };
@@ -485,6 +506,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     if (isSessionActiveRef.current) return;
     isSessionActiveRef.current = true;
     setIsSessionActive(true);
+    micRetryCountRef.current = 0;
     await startListeningFn();
   };
 
