@@ -1,11 +1,10 @@
 import TrackPlayer, { Event } from "react-native-track-player";
-import { emitRemotePlay, emitRemotePause, emitRemoteToggle } from "./trackPlayerEvents";
+import { toggleVoiceLoop } from "./voiceLoopService";
 
 /**
  * Generates a short 440 Hz sine-wave beep as a base64-encoded WAV string.
- * The beep is 0.4 s long with 50 ms fade-in/out to avoid clicks.
- * This runs entirely in JS (no native dependencies) so it works in the
- * headless PlaybackService context.
+ * 0.4 s long with 50 ms fade-in/out to avoid clicks.
+ * Runs entirely in JS — works in the headless PlaybackService context.
  */
 function generateBeepWavBase64(
   freq = 440,
@@ -63,14 +62,8 @@ function generateBeepWavBase64(
 }
 
 /**
- * Plays a short confirmation beep directly from the headless PlaybackService
- * context, BEFORE emitting the toggle event.
- *
- * This gives the user audible feedback that the button press was registered
- * even when the screen is off and the React UI is suspended.
- *
- * Uses expo-av (native module — works in headless JS) and expo-file-system to
- * write the generated WAV to the cache directory.
+ * Plays a short confirmation beep from inside the headless PlaybackService
+ * BEFORE toggling the voice loop. Gives audible feedback when the screen is off.
  */
 async function playConfirmationBeep(): Promise<void> {
   try {
@@ -78,12 +71,14 @@ async function playConfirmationBeep(): Promise<void> {
     const { Audio } = await import("expo-av");
 
     const beepPath = `${FileSystem.cacheDirectory}confirm_beep.wav`;
-    const beepBase64 = generateBeepWavBase64();
-    await FileSystem.writeAsStringAsync(beepPath, beepBase64, {
+    await FileSystem.writeAsStringAsync(beepPath, generateBeepWavBase64(), {
       encoding: FileSystem.EncodingType.Base64,
     });
 
-    const { sound } = await Audio.Sound.createAsync({ uri: beepPath }, { shouldPlay: true, volume: 1.0 });
+    const { sound } = await Audio.Sound.createAsync(
+      { uri: beepPath },
+      { shouldPlay: true, volume: 1.0 }
+    );
     await new Promise<void>((resolve) => {
       sound.setOnPlaybackStatusUpdate((status) => {
         if (status.isLoaded && status.didJustFinish) {
@@ -91,83 +86,55 @@ async function playConfirmationBeep(): Promise<void> {
           resolve();
         }
       });
-      // Safety timeout in case the callback never fires
-      setTimeout(resolve, 1500);
+      setTimeout(resolve, 1500); // safety timeout
     });
   } catch (err) {
     console.warn("[PlaybackService] Beep failed (non-fatal):", err);
   }
 }
 
-/**
- * FIX 3 — Do NOT try to restart the background foreground service from
- * the headless context.  Android 12+ blocks startForegroundService() calls
- * from background (BackgroundServiceStartNotAllowedException).
- *
- * The service is started eagerly by AssistantContext while the app is in the
- * foreground. If it somehow died, the user will need to bring the app back to
- * the foreground. Attempting to restart here causes a crash, not a recovery.
- */
-async function warnIfBackgroundServiceStopped(): Promise<void> {
-  try {
-    const BackgroundService = (await import("react-native-background-actions")).default;
-    const isRunning = await BackgroundService.isRunning();
-    if (!isRunning) {
-      console.warn(
-        "[PlaybackService] BackgroundService is not running. " +
-        "Open the app to re-activate it. " +
-        "(Not attempting restart — Android 12+ blocks this from background.)"
-      );
-    }
-  } catch (e) {
-    console.warn("[PlaybackService] Could not check BackgroundService:", e);
-  }
-}
-
 export async function PlaybackService(): Promise<void> {
   /**
-   * RemotePlay — headphone single press (play action from media notification).
-   * Play a beep first so the user hears feedback with screen off, then emit
-   * the toggle so AssistantContext starts the recording session.
+   * All headset button events call toggleVoiceLoop() directly.
+   *
+   * toggleVoiceLoop() lives in voiceLoopService.ts which uses MODULE-LEVEL
+   * state — the same JS runtime as the PlaybackService headless task. This
+   * means the full voice loop (mic → API → TTS → mic) runs independently of
+   * any React component lifecycle (FIX 2: Headless Loop).
+   *
+   * We play a beep FIRST so the user hears confirmation before the mic opens.
    */
+
   TrackPlayer.addEventListener(Event.RemotePlay, async () => {
-    console.log("[PlaybackService] RemotePlay received");
+    console.log("[PlaybackService] RemotePlay");
     void TrackPlayer.play();
-    void warnIfBackgroundServiceStopped();
     await playConfirmationBeep();
-    emitRemotePlay();
-    emitRemoteToggle();
+    toggleVoiceLoop();
   });
 
   TrackPlayer.addEventListener(Event.RemotePause, async () => {
-    console.log("[PlaybackService] RemotePause received");
-    void TrackPlayer.play();
-    void warnIfBackgroundServiceStopped();
+    console.log("[PlaybackService] RemotePause");
+    void TrackPlayer.play(); // keep silent track alive
     await playConfirmationBeep();
-    emitRemotePause();
-    emitRemoteToggle();
+    toggleVoiceLoop();
   });
 
   TrackPlayer.addEventListener(Event.RemoteStop, () => {
-    console.log("[PlaybackService] RemoteStop received");
+    console.log("[PlaybackService] RemoteStop");
     void TrackPlayer.stop();
   });
 
-  /**
-   * Single-button headphones send RemoteNext on first press.
-   */
+  /** Single-button headphones send RemoteNext on first press */
   TrackPlayer.addEventListener(Event.RemoteNext, async () => {
-    console.log("[PlaybackService] RemoteNext received (headset single press)");
-    void warnIfBackgroundServiceStopped();
+    console.log("[PlaybackService] RemoteNext (headset single press)");
     await playConfirmationBeep();
-    emitRemoteToggle();
+    toggleVoiceLoop();
   });
 
   TrackPlayer.addEventListener(Event.RemotePrevious, async () => {
-    console.log("[PlaybackService] RemotePrevious received (headset press)");
-    void warnIfBackgroundServiceStopped();
+    console.log("[PlaybackService] RemotePrevious (headset press)");
     await playConfirmationBeep();
-    emitRemoteToggle();
+    toggleVoiceLoop();
   });
 
   TrackPlayer.addEventListener(Event.RemoteDuck, async (event) => {

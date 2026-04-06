@@ -1,7 +1,7 @@
 export async function setupTrackPlayer(
   _onPlay: () => void,
   _onPause: () => void,
-  _onToggle: () => void
+  _onToggle?: () => void
 ): Promise<boolean> {
   return false;
 }

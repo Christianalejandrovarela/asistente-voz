@@ -1,33 +1,39 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Audio } from "expo-av";
-import * as FileSystem from "expo-file-system/legacy";
-import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { Alert, Platform } from "react-native";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { Alert, DeviceEventEmitter } from "react-native";
 
-import { setupTrackPlayer, destroyTrackPlayer, pauseSilentTrack, resumeSilentTrack } from "@/services/trackPlayer";
-import { startBackgroundService, stopBackgroundService } from "@/services/backgroundService";
+import { setupTrackPlayer, destroyTrackPlayer } from "@/services/trackPlayer";
+import { startBackgroundService } from "@/services/backgroundService";
 import { requestBatteryOptimizationExemption } from "@/services/androidBatteryOptimization";
-import { initDb, getMessages, addMessage, clearMessages, startAutoPurge, stopAutoPurge, purgeOldMessages } from "@/services/conversationDb";
+import { initDb, getMessages, clearMessages, startAutoPurge, stopAutoPurge } from "@/services/conversationDb";
 import { RollingBufferManager } from "@/services/rollingBufferManager";
 import { onBluetoothDisconnect } from "@/services/bluetoothAudio";
+import {
+  startVoiceLoop,
+  stopVoiceLoop,
+  interruptSpeaking as interruptSpeakingService,
+  getVoiceLoopSnapshot,
+  updateLoopSettings,
+  VoiceLoopStatus,
+  VoiceMessage,
+  VL_STATUS,
+  VL_SESSION,
+  VL_MESSAGES,
+  VL_DEBUG,
+  VL_ERROR,
+} from "@/services/voiceLoopService";
 
-export type AssistantStatus = "idle" | "waiting" | "recording" | "processing" | "speaking";
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-interface VoiceApiResponse {
-  audio: string;
-  userText: string;
-  assistantText: string;
-  /** Returned when the server compressed the history (every ~7 turns).
-   *  Client should store this, clear SQLite history, and send it on future calls. */
-  newContextSummary?: string;
-}
-
-export interface ChatMessage {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-  timestamp: number;
-}
+export type AssistantStatus = VoiceLoopStatus;
+export type { VoiceMessage as ChatMessage };
 
 export interface AssistantSettings {
   voice: "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer";
@@ -42,107 +48,124 @@ interface RollingBufferContext {
 interface AssistantContextValue {
   status: AssistantStatus;
   isSessionActive: boolean;
-  messages: ChatMessage[];
+  messages: VoiceMessage[];
   settings: AssistantSettings;
   isBluetoothActive: boolean;
   rollingBuffer: RollingBufferContext;
   debugInfo: string;
   startSession: () => Promise<void>;
   stopSession: () => Promise<void>;
-  interruptSpeaking: () => Promise<void>;
+  interruptSpeaking: () => void;
   clearHistory: () => void;
   updateSettings: (settings: Partial<AssistantSettings>) => void;
   toggleRollingBuffer: (enabled: boolean) => Promise<void>;
 }
 
-const AssistantContext = createContext<AssistantContextValue | null>(null);
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-const SETTINGS_KEY = "@voice_assistant_settings";
+const SETTINGS_KEY      = "@voice_assistant_settings";
 const ROLLING_BUFFER_KEY = "@rolling_buffer_active";
 const CONTEXT_SUMMARY_KEY = "@context_summary";
 
 const DEFAULT_SETTINGS: AssistantSettings = { voice: "nova", language: "es" };
 
-const VAD_SILENCE_THRESHOLD_DB = -45;
-const VAD_SILENCE_DURATION_MS = 1500;
-const VAD_MIN_SPEECH_MS = 300;
-const MAX_RECORDING_MS = 60_000;
-// After AI responds, mic stays open this long waiting for a follow-up question.
-// If no speech detected → session ends automatically (passive background mode).
-const FOLLOW_UP_WINDOW_MS = 7000;
+// ─── Context ──────────────────────────────────────────────────────────────────
 
-function generateId(): string {
-  return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
-}
-
-async function readUriAsBase64(uri: string): Promise<string> {
-  if (Platform.OS === "web" || uri.startsWith("blob:")) {
-    const resp = await fetch(uri);
-    const blob = await resp.blob();
-    return new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const result = reader.result as string;
-        resolve(result.split(",")[1]);
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
-  }
-  return FileSystem.readAsStringAsync(uri, { encoding: "base64" });
-}
+const AssistantContext = createContext<AssistantContextValue | null>(null);
 
 export function AssistantProvider({ children }: { children: React.ReactNode }) {
-  const [status, setStatus] = useState<AssistantStatus>("idle");
-  const [isSessionActive, setIsSessionActive] = useState(false);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [settings, setSettings] = useState<AssistantSettings>(DEFAULT_SETTINGS);
+  // ── Synced snapshots of voiceLoopService state (for UI display only) ────────
+  const snap = getVoiceLoopSnapshot();
+  const [status, setStatus]                 = useState<AssistantStatus>(snap.status);
+  const [isSessionActive, setIsSessionActive] = useState(snap.isActive);
+  const [messages, setMessages]             = useState<VoiceMessage[]>([]);
+  const [settings, setSettings]             = useState<AssistantSettings>(DEFAULT_SETTINGS);
   const [isBluetoothActive, setIsBluetoothActive] = useState(false);
   const [isRollingBufferActive, setIsRollingBufferActive] = useState(false);
-  const [debugInfo, setDebugInfo] = useState("Iniciando...");
+  const [debugInfo, setDebugInfo]           = useState("Iniciando...");
 
-  const recordingRef = useRef<Audio.Recording | null>(null);
-  const soundRef = useRef<Audio.Sound | null>(null);
-  const statusRef = useRef<AssistantStatus>("idle");
-  const isSessionActiveRef = useRef(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const maxRecordingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const followUpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const settingsRef = useRef<AssistantSettings>(DEFAULT_SETTINGS);
-  // Compressed summary of previous conversation turns.
-  // Persisted to AsyncStorage; sent with each API request so context survives session restarts.
-  const contextSummaryRef = useRef<string>("");
-  // Count consecutive mic-start failures to stop the retry loop after MAX_MIC_RETRIES
-  const micRetryCountRef = useRef(0);
-  const MAX_MIC_RETRIES = 3;
-
-  // Sync setter: updates the ref immediately (same tick) so guards that read
-  // statusRef.current right after a setStatus call see the new value at once,
-  // without waiting for React to flush the re-render.
-  const setStatusSync = (s: AssistantStatus) => {
-    statusRef.current = s;
-    setStatus(s);
-  };
-
+  // ── Load persisted data ──────────────────────────────────────────────────────
   useEffect(() => {
-    settingsRef.current = settings;
-  }, [settings]);
-
-  const handleRemoteToggleRef = useRef<() => void>(() => {});
-  useEffect(() => {
-    handleRemoteToggleRef.current = () => {
-      if (!isSessionActiveRef.current) {
-        void startSessionFn();
-      } else {
-        void stopSessionFn();
+    const load = async () => {
+      try {
+        await initDb();
+        const [storedMsgs, storedSettings] = await Promise.all([
+          getMessages(50),
+          AsyncStorage.getItem(SETTINGS_KEY),
+        ]);
+        setMessages(storedMsgs as VoiceMessage[]);
+        if (storedSettings) {
+          const parsed = JSON.parse(storedSettings) as AssistantSettings;
+          setSettings(parsed);
+        }
+      } catch (err) {
+        console.error("[AssistantContext] Failed to load persisted data:", err);
       }
     };
-  });
-
-  useEffect(() => {
-    void loadStoredData();
+    void load();
   }, []);
 
+  // ── Rolling buffer restore ────────────────────────────────────────────────
+  useEffect(() => {
+    const restoreBuffer = async () => {
+      try {
+        const stored = await AsyncStorage.getItem(ROLLING_BUFFER_KEY);
+        if (stored === "true") {
+          const ok = await RollingBufferManager.start();
+          setIsRollingBufferActive(ok);
+        }
+      } catch {}
+    };
+    void restoreBuffer();
+  }, []);
+
+  // ── Periodic message pruning ───────────────────────────────────────────────
+  useEffect(() => {
+    startAutoPurge();
+    const pruneUI = setInterval(() => {
+      const cutoff = Date.now() - 10 * 60 * 1000;
+      setMessages((prev) => prev.filter((m) => m.timestamp >= cutoff));
+    }, 60_000);
+    return () => {
+      stopAutoPurge();
+      clearInterval(pruneUI);
+    };
+  }, []);
+
+  // ── Subscribe to voiceLoopService events ──────────────────────────────────
+  useEffect(() => {
+    const subs = [
+      DeviceEventEmitter.addListener(VL_STATUS, ({ status: s }: { status: AssistantStatus }) => {
+        setStatus(s);
+      }),
+      DeviceEventEmitter.addListener(VL_SESSION, ({ active }: { active: boolean }) => {
+        setIsSessionActive(active);
+      }),
+      DeviceEventEmitter.addListener(VL_MESSAGES, (payload: { messages?: VoiceMessage[]; append?: VoiceMessage[] }) => {
+        if (payload.messages !== undefined) {
+          // Full replace (e.g. after context compression)
+          setMessages(payload.messages);
+        } else if (payload.append) {
+          setMessages((prev) => [...prev, ...payload.append!]);
+        }
+      }),
+      DeviceEventEmitter.addListener(VL_DEBUG, ({ info }: { info: string }) => {
+        setDebugInfo(info);
+      }),
+      DeviceEventEmitter.addListener(VL_ERROR, ({ title, body }: { title: string; body: string }) => {
+        Alert.alert(title, body, [{ text: "OK" }]);
+      }),
+    ];
+
+    // Sync React state with any loop activity that started before this mount
+    const { status: s, isActive } = getVoiceLoopSnapshot();
+    setStatus(s);
+    setIsSessionActive(isActive);
+
+    return () => { subs.forEach((s) => s.remove()); };
+  }, []);
+
+  // ── TrackPlayer + BackgroundService init ──────────────────────────────────
   useEffect(() => {
     let btCleanup: (() => void) | null = null;
 
@@ -151,11 +174,9 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       let btOk = false;
       try {
         const [tpResult] = await Promise.all([
-          setupTrackPlayer(
-            () => { handleRemoteToggleRef.current(); },
-            () => { handleRemoteToggleRef.current(); },
-            () => { handleRemoteToggleRef.current(); }
-          ),
+          // onPlay/onPause are no-ops here — the headset button is handled by
+          // PlaybackService which calls toggleVoiceLoop() directly.
+          setupTrackPlayer(() => {}, () => {}),
           startBackgroundService(),
         ]);
         btOk = tpResult;
@@ -167,15 +188,17 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       setIsBluetoothActive(btOk);
 
       if (btOk) {
-        const bufferStarted = await RollingBufferManager.start();
-        if (bufferStarted) {
-          setIsRollingBufferActive(true);
-          await AsyncStorage.setItem(ROLLING_BUFFER_KEY, "true");
-        }
-        btCleanup = onBluetoothDisconnect(() => { void handleBluetoothDisconnect(); });
+        btCleanup = onBluetoothDisconnect(() => {
+          void stopVoiceLoop();
+          setDebugInfo("Auricular desconectado");
+        });
       }
+
+      // Battery optimization exemption (Android only)
+      void requestBatteryOptimizationExemption();
     };
     void init();
+
     return () => {
       if (btCleanup) btCleanup();
       void destroyTrackPlayer();
@@ -183,511 +206,22 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    startAutoPurge();
-    const memoryPurge = setInterval(() => {
-      const cutoff = Date.now() - 10 * 60 * 1000;
-      setMessages((prev) => prev.filter((m) => m.timestamp >= cutoff));
-    }, 60_000);
-    return () => {
-      stopAutoPurge();
-      clearInterval(memoryPurge);
-    };
-  }, []);
-
-  const handleBluetoothDisconnect = async () => {
-    await RollingBufferManager.stop();
-    setIsRollingBufferActive(false);
-    await AsyncStorage.setItem(ROLLING_BUFFER_KEY, "false");
-    // Keep background service running so headphone button still works after disconnect
-    setIsBluetoothActive(false);
-  };
-
-  const loadStoredData = async () => {
-    try {
-      await initDb();
-      const [storedMsgs, storedSettings, storedSummary] = await Promise.all([
-        getMessages(200),
-        AsyncStorage.getItem(SETTINGS_KEY),
-        AsyncStorage.getItem(CONTEXT_SUMMARY_KEY),
-      ]);
-      // Request Doze Mode exemption on Android so the JS thread is never
-      // throttled/paused while the screen is off.  Non-blocking — shown once.
-      void requestBatteryOptimizationExemption();
-      setMessages(storedMsgs);
-      if (storedSettings) {
-        setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(storedSettings) as Partial<AssistantSettings> });
-      }
-      if (storedSummary) {
-        contextSummaryRef.current = storedSummary;
-      }
-    } catch {}
-  };
-
-  const addMessages = useCallback((newMsgs: ChatMessage[]) => {
-    setMessages((prev) => [...prev, ...newMsgs]);
-    void Promise.all(newMsgs.map((m) => addMessage(m)));
-  }, []);
-
-  const clearMaxTimer = () => {
-    if (maxRecordingTimerRef.current) {
-      clearTimeout(maxRecordingTimerRef.current);
-      maxRecordingTimerRef.current = null;
-    }
-  };
-
-  const clearFollowUpTimer = () => {
-    if (followUpTimerRef.current) {
-      clearTimeout(followUpTimerRef.current);
-      followUpTimerRef.current = null;
-    }
-  };
-
-  // isFollowUp=true → "Gemini Live" mode: mic opens after AI response for FOLLOW_UP_WINDOW_MS.
-  // If voice is detected → continues conversation. If silence → session ends automatically.
-  const startListeningFn = async (isFollowUp = false) => {
-    if (!isSessionActiveRef.current) return;
-    if (statusRef.current !== "idle") return;
-
-    try {
-      const { status: permStatus } = await Audio.requestPermissionsAsync();
-      if (permStatus !== "granted") {
-        Alert.alert(
-          "Permiso de micrófono",
-          "Para usar el asistente necesitas conceder acceso al micrófono en los ajustes.",
-          [{ text: "OK" }]
-        );
-        await stopSessionFn();
-        return;
-      }
-
-      clearFollowUpTimer();
-      await RollingBufferManager.pause();
-      await pauseSilentTrack();
-
-      // setAudioModeAsync with shouldDuckAndroid:false instructs Android to
-      // steal exclusive audio focus from RNTP synchronously — no arbitrary
-      // delay needed. staysActiveInBackground keeps the session alive after
-      // the screen turns off so the mic stays open throughout the session.
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-        ...(Platform.OS === "android" ? {
-          staysActiveInBackground: true,
-          shouldDuckAndroid: false,
-          playThroughEarpieceAndroid: false,
-        } : {}),
-      });
-
-      const { recording } = await Audio.Recording.createAsync(
-        {
-          ...Audio.RecordingOptionsPresets.HIGH_QUALITY,
-          isMeteringEnabled: true,
-        },
-        undefined,
-        100
-      );
-
-      recordingRef.current = recording;
-      // Success — reset the failure counter
-      micRetryCountRef.current = 0;
-      // Follow-up mode: show "waiting" until the user starts speaking.
-      // Normal mode: show "recording" immediately.
-      setStatusSync(isFollowUp ? "waiting" : "recording");
-
-      let hasSpeech = false;
-      let silenceStart: number | null = null;
-      let speechStartTime: number | null = null;
-      let vadTriggered = false;
-
-      // Follow-up window timer: if no speech in FOLLOW_UP_WINDOW_MS → end session automatically
-      if (isFollowUp) {
-        followUpTimerRef.current = setTimeout(() => {
-          if (!hasSpeech && !vadTriggered && isSessionActiveRef.current) {
-            console.log("[VoiceAssistant] Follow-up window expired with no speech → ending session");
-            recording.setOnRecordingStatusUpdate(null);
-            clearMaxTimer();
-            void stopSessionFn();
-          }
-        }, FOLLOW_UP_WINDOW_MS);
-      }
-
-      recording.setOnRecordingStatusUpdate((s) => {
-        if (!isSessionActiveRef.current || vadTriggered) return;
-        if (!s.isRecording) return;
-
-        const metering = s.metering ?? -160;
-        const now = Date.now();
-
-        if (metering > VAD_SILENCE_THRESHOLD_DB) {
-          if (!hasSpeech) {
-            hasSpeech = true;
-            speechStartTime = now;
-            // User started speaking — cancel follow-up timeout and switch to active recording
-            clearFollowUpTimer();
-            if (statusRef.current === "waiting") {
-              setStatusSync("recording");
-            }
-          }
-          silenceStart = null;
-        } else if (hasSpeech) {
-          if (!silenceStart) silenceStart = now;
-          const speechDuration = speechStartTime ? now - speechStartTime : 0;
-          if (
-            now - silenceStart >= VAD_SILENCE_DURATION_MS &&
-            speechDuration >= VAD_MIN_SPEECH_MS
-          ) {
-            vadTriggered = true;
-            recording.setOnRecordingStatusUpdate(null);
-            clearMaxTimer();
-            clearFollowUpTimer();
-            void sendCurrentRecordingFn();
-          }
-        }
-      });
-
-      maxRecordingTimerRef.current = setTimeout(() => {
-        if (!vadTriggered && isSessionActiveRef.current &&
-          (statusRef.current === "recording" || statusRef.current === "waiting")) {
-          vadTriggered = true;
-          clearFollowUpTimer();
-          void sendCurrentRecordingFn();
-        }
-      }, MAX_RECORDING_MS);
-    } catch (err) {
-      const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-      console.error("[VoiceAssistant] Error starting listening:", msg);
-      micRetryCountRef.current += 1;
-      setDebugInfo(`Error mic (${micRetryCountRef.current}/${MAX_MIC_RETRIES}): ${msg}`);
-      setStatusSync("idle");
-      await RollingBufferManager.resume();
-      await resumeSilentTrack();
-      if (isSessionActiveRef.current) {
-        if (micRetryCountRef.current < MAX_MIC_RETRIES) {
-          // Retry with backoff
-          setTimeout(() => { void startListeningFn(); }, 1000 * micRetryCountRef.current);
-        } else {
-          // Give up — stop session and show the error clearly
-          console.error("[VoiceAssistant] Max mic retries reached — stopping session");
-          Alert.alert(
-            "Error de micrófono",
-            `No se pudo iniciar el micrófono después de ${MAX_MIC_RETRIES} intentos.\n\n${msg}`,
-            [{ text: "OK" }]
-          );
-          void stopSessionFn();
-        }
-      }
-    }
-  };
-
-  const sendCurrentRecordingFn = async () => {
-    clearMaxTimer();
-    if ((statusRef.current !== "recording" && statusRef.current !== "waiting") || !recordingRef.current) return;
-    setStatusSync("processing");
-
-    try {
-      const recording = recordingRef.current;
-      recordingRef.current = null;
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-
-      if (!uri) throw new Error("No recording URI");
-
-      const base64Audio = await readUriAsBase64(uri);
-
-      if (!isSessionActiveRef.current) {
-        setStatusSync("idle");
-        await RollingBufferManager.resume();
-        await resumeSilentTrack();
-        return;
-      }
-
-      const domain = process.env.EXPO_PUBLIC_DOMAIN;
-      const apiUrl = domain
-        ? `https://${domain}/api/voice/chat`
-        : "http://localhost:8080/api/voice/chat";
-
-      await purgeOldMessages();
-      const currentSettings = settingsRef.current;
-      const recentHistory = await getMessages(20);
-      const contextText = RollingBufferManager.getContextText();
-
-      const historyPayload: { role: string; text: string }[] = [];
-      if (contextText.length > 0) {
-        historyPayload.push({
-          role: "user",
-          text: `[Contexto ambiental]: ${contextText}`,
-        });
-      }
-      for (const m of recentHistory) {
-        if (!m.text.startsWith("[contexto]")) {
-          historyPayload.push({ role: m.role, text: m.text });
-        }
-      }
-
-      abortControllerRef.current = new AbortController();
-      const response = await fetch(apiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          audio: base64Audio,
-          voice: currentSettings.voice,
-          language: currentSettings.language,
-          history: historyPayload.slice(-30),
-          // Compressed summary from a previous compression cycle (may be empty)
-          contextSummary: contextSummaryRef.current || undefined,
-        }),
-        signal: abortControllerRef.current.signal,
-      });
-      abortControllerRef.current = null;
-
-      if (!isSessionActiveRef.current) {
-        setStatusSync("idle");
-        await RollingBufferManager.resume();
-        await resumeSilentTrack();
-        return;
-      }
-
-      if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`API ${response.status}: ${errText}`);
-      }
-
-      const data = await response.json() as VoiceApiResponse;
-      const now = Date.now();
-
-      // Context compression: server compressed the history into a summary.
-      // Clear SQLite chat history, store the new summary for future requests.
-      if (data.newContextSummary) {
-        console.log("[VoiceAssistant] Context compressed — resetting local history");
-        contextSummaryRef.current = data.newContextSummary;
-        await clearMessages();
-        setMessages([]);
-        void AsyncStorage.setItem(CONTEXT_SUMMARY_KEY, data.newContextSummary);
-      }
-
-      addMessages([
-        { id: generateId(), role: "user", text: data.userText, timestamp: now },
-        { id: generateId(), role: "assistant", text: data.assistantText, timestamp: now + 1 },
-      ]);
-
-      if (!isSessionActiveRef.current) {
-        setStatusSync("idle");
-        await RollingBufferManager.resume();
-        await resumeSilentTrack();
-        return;
-      }
-
-      setStatusSync("speaking");
-      await playResponseAudio(data.audio);
-
-      if (isSessionActiveRef.current) {
-        setStatusSync("idle");
-        // Gemini Live-style: mic reopens automatically after AI responds.
-        // If no speech in FOLLOW_UP_WINDOW_MS → session ends, returns to background.
-        void startListeningFn(true);
-      } else {
-        setStatusSync("idle");
-        await RollingBufferManager.resume();
-        await resumeSilentTrack();
-      }
-    } catch (err) {
-      const isAbort = err instanceof Error && err.name === "AbortError";
-      if (!isAbort) {
-        console.error("[VoiceAssistant] Error sending recording:", err);
-        const message = err instanceof Error ? err.message : "Error desconocido";
-        Alert.alert("Error", `No se pudo procesar: ${message}`, [{ text: "OK" }]);
-      }
-      setStatusSync("idle");
-      await RollingBufferManager.resume();
-      await resumeSilentTrack();
-      if (isSessionActiveRef.current && !isAbort) {
-        setTimeout(() => { void startListeningFn(); }, 1000);
-      }
-    }
-  };
-
-  const startSessionFn = async () => {
-    if (isSessionActiveRef.current) return;
-    isSessionActiveRef.current = true;
-    setIsSessionActive(true);
-    micRetryCountRef.current = 0;
-    await startListeningFn();
-  };
-
-  const stopSessionFn = async () => {
-    if (!isSessionActiveRef.current) return;
-    isSessionActiveRef.current = false;
-    setIsSessionActive(false);
-
-    clearMaxTimer();
-    clearFollowUpTimer();
-
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-
-    if (recordingRef.current) {
-      try {
-        recordingRef.current.setOnRecordingStatusUpdate(null);
-        await recordingRef.current.stopAndUnloadAsync();
-      } catch {}
-      recordingRef.current = null;
-    }
-
-    if (soundRef.current) {
-      try { await soundRef.current.stopAsync(); } catch {}
-      try { await soundRef.current.unloadAsync(); } catch {}
-      soundRef.current = null;
-    }
-
-    await RollingBufferManager.resume();
-    await resumeSilentTrack();
-    setStatusSync("idle");
-  };
-
-  // Ref to resolve the playback promise from outside (used by interruptSpeaking)
-  const playbackResolveRef = useRef<(() => void) | null>(null);
-
-  const interruptSpeakingFn = async () => {
-    if (statusRef.current !== "speaking") return;
-    // Resolve the awaited playback promise first so sendCurrentRecordingFn can continue
-    playbackResolveRef.current?.();
-    playbackResolveRef.current = null;
-    // Stop audio immediately
-    if (soundRef.current) {
-      try { await soundRef.current.stopAsync(); } catch {}
-      try { await soundRef.current.unloadAsync(); } catch {}
-      soundRef.current = null;
-    }
-    // startListeningFn will be called by sendCurrentRecordingFn once the
-    // playResponseAudio promise resolves (which we just triggered above)
-  };
-
-  const playResponseAudio = async (base64Audio: string) => {
-    let tmpPath = "";
-    try {
-      if (soundRef.current) {
-        try { await soundRef.current.stopAsync(); } catch {}
-        try { await soundRef.current.unloadAsync(); } catch {}
-        soundRef.current = null;
-      }
-
-      // Unique filename avoids stale file conflicts between calls
-      tmpPath = `${FileSystem.cacheDirectory ?? ""}ai_resp_${Date.now()}.mp3`;
-      await FileSystem.writeAsStringAsync(tmpPath, base64Audio, { encoding: "base64" });
-
-      // allowsRecordingIOS:true enables simultaneous mic monitoring (barge-in)
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: true,
-        shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
-      });
-
-      // Register the playback callback BEFORE createAsync so didJustFinish is
-      // never missed due to a race condition.
-      let resolvePlayback!: () => void;
-      const playbackDone = new Promise<void>((res) => {
-        resolvePlayback = res;
-        playbackResolveRef.current = res;
-      });
-
-      const { sound } = await Audio.Sound.createAsync(
-        { uri: tmpPath },
-        { shouldPlay: true, volume: 1.0 },
-        (ps) => {
-          if (!ps.isLoaded) return;
-          if (
-            ps.didJustFinish ||
-            (!ps.isPlaying &&
-              ps.positionMillis > 0 &&
-              ps.durationMillis !== undefined &&
-              ps.positionMillis >= ps.durationMillis - 200)
-          ) {
-            resolvePlayback();
-          }
-        }
-      );
-      soundRef.current = sound;
-
-      // ── Barge-in: monitor mic while AI speaks ──────────────────────────────
-      // If the user starts talking, we interrupt the AI immediately.
-      let bargeInRec: Audio.Recording | null = null;
-      try {
-        const { recording } = await Audio.Recording.createAsync(
-          { ...Audio.RecordingOptionsPresets.HIGH_QUALITY, isMeteringEnabled: true },
-          undefined,
-          80 // poll every 80 ms
-        );
-        bargeInRec = recording;
-        let speechStart: number | null = null;
-
-        recording.setOnRecordingStatusUpdate((s) => {
-          if (!s.isRecording || !isSessionActiveRef.current) return;
-          const db = s.metering ?? -160;
-          if (db > VAD_SILENCE_THRESHOLD_DB) {
-            if (!speechStart) speechStart = Date.now();
-            // Require at least MIN_SPEECH_MS of sustained voice before triggering
-            if (Date.now() - speechStart >= VAD_MIN_SPEECH_MS) {
-              recording.setOnRecordingStatusUpdate(null);
-              resolvePlayback(); // interrupt playback
-            }
-          } else {
-            speechStart = null; // reset on silence
-          }
-        });
-      } catch {
-        // Barge-in unavailable (permissions, device limit) — continue without it
-      }
-
-      // Safety-net timeout: if playback status never fires, unblock after 3 min
-      const safetyTimeout = new Promise<void>((res) => setTimeout(res, 3 * 60 * 1000));
-      await Promise.race([playbackDone, safetyTimeout]);
-
-      // Stop barge-in monitor
-      if (bargeInRec) {
-        try {
-          bargeInRec.setOnRecordingStatusUpdate(null);
-          await bargeInRec.stopAndUnloadAsync();
-        } catch {}
-        bargeInRec = null;
-      }
-
-      playbackResolveRef.current = null;
-      try { await sound.stopAsync(); } catch {}
-      try { await sound.unloadAsync(); } catch {}
-      soundRef.current = null;
-    } catch (err) {
-      console.error("[VoiceAssistant] Error playing audio:", err);
-    } finally {
-      // Clean up temp file
-      if (tmpPath) {
-        try { await FileSystem.deleteAsync(tmpPath, { idempotent: true }); } catch {}
-      }
-    }
-  };
+  // ── Public API ────────────────────────────────────────────────────────────
 
   const startSession = useCallback(async () => {
-    await startSessionFn();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    await startVoiceLoop();
   }, []);
 
   const stopSession = useCallback(async () => {
-    await stopSessionFn();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    await stopVoiceLoop();
   }, []);
 
-  const interruptSpeaking = useCallback(async () => {
-    await interruptSpeakingFn();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  const interruptSpeaking = useCallback(() => {
+    interruptSpeakingService();
   }, []);
 
   const clearHistory = useCallback(() => {
     setMessages([]);
-    contextSummaryRef.current = "";
     void clearMessages();
     void AsyncStorage.removeItem(CONTEXT_SUMMARY_KEY);
   }, []);
@@ -695,7 +229,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const updateSettings = useCallback((newSettings: Partial<AssistantSettings>) => {
     setSettings((prev) => {
       const updated = { ...prev, ...newSettings };
-      void AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(updated));
+      updateLoopSettings(updated);
       return updated;
     });
   }, []);
