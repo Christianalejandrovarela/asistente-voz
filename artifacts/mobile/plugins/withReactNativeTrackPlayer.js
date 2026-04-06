@@ -21,37 +21,44 @@ function withReactNativeTrackPlayer(config) {
     if (!application.service) application.service = [];
 
     /**
-     * RNTP v4 service class.
-     * react-native-background-actions v4 service class.
-     * Both services need foregroundServiceType="mediaPlayback|microphone" so
-     * Android 10+ allows audio capture + playback from a foreground service
-     * even when the screen is off.
+     * RNTP v4 service class name.
+     * react-native-background-actions v4 service class name.
+     *
+     * Both need foregroundServiceType="mediaPlayback|microphone" so Android 10+
+     * permits audio capture + playback from a foreground service when the screen
+     * is off.  android:stopWithTask="false" keeps the services alive when the
+     * task is removed from the recents list.
+     *
+     * We deliberately do NOT touch android:exported here — we let each library's
+     * own manifest declare that value to avoid Gradle manifest-merger conflicts.
      */
     const RNTP_SERVICE       = "com.doublesymmetry.trackplayer.service.MusicService";
     const BG_ACTIONS_SERVICE = "com.asterinet.react.bgactions.RNBackgroundActionsTask";
     const COMBINED_FG_TYPE   = "mediaPlayback|microphone";
 
     /**
-     * Merge the foregroundServiceType and stopWithTask attrs into an
-     * existing service entry, preserving intent-filters and other attrs
-     * already set by the library's own plugin.  If the entry does not exist
-     * yet we create a minimal one so the attribute is present at compile time.
+     * Merge ONLY foregroundServiceType and stopWithTask into an existing
+     * service entry, preserving ALL other attributes (including exported,
+     * intent-filters, etc.) set by the library's own config plugin.
+     * If no entry exists yet we create a minimal stub — the library's plugin
+     * will merge its own attributes later.
      */
     const upsertServiceAttrs = (name, fgType) => {
       const idx = application.service.findIndex(
         (s) => s.$?.["android:name"] === name
       );
       if (idx >= 0) {
+        // Merge into existing entry — keep everything the library already set.
         application.service[idx].$ = {
           ...application.service[idx].$,
           "android:foregroundServiceType": fgType,
           "android:stopWithTask": "false",
         };
       } else {
+        // Stub entry — no android:exported so the library manifest wins at merge time.
         application.service.push({
           $: {
             "android:name": name,
-            "android:exported": "false",
             "android:foregroundServiceType": fgType,
             "android:stopWithTask": "false",
           },
@@ -63,16 +70,15 @@ function withReactNativeTrackPlayer(config) {
     upsertServiceAttrs(BG_ACTIONS_SERVICE, COMBINED_FG_TYPE);
 
     /**
-     * Ensure the battery optimization exemption permission is present
-     * (system permission — ignored on devices below Android 6).
+     * Ensure the battery-optimization exemption permission is present
+     * (system permission — silently ignored on devices below Android 6).
      */
-    const permissions = manifest.manifest["uses-permission"] ?? [];
+    if (!manifest.manifest["uses-permission"]) manifest.manifest["uses-permission"] = [];
     const BATT_PERM = "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS";
-    const hasBattPerm = permissions.some(
+    const hasBattPerm = manifest.manifest["uses-permission"].some(
       (p) => p.$?.["android:name"] === BATT_PERM
     );
     if (!hasBattPerm) {
-      if (!manifest.manifest["uses-permission"]) manifest.manifest["uses-permission"] = [];
       manifest.manifest["uses-permission"].push({ $: { "android:name": BATT_PERM } });
     }
 
