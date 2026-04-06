@@ -54,7 +54,7 @@ export async function startBackgroundService(): Promise<boolean> {
         type: "mipmap",
       },
       color: "#4f6ef7",
-      linkingURI: "mobile://",
+      linkingURI: "mobile:///",
       progressBar: {
         max: 100,
         value: 0,
