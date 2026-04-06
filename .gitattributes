@@ -1,1 +1,2 @@
 downloads/app-preview.apk filter=lfs diff=lfs merge=lfs -text
+downloads/AsistenteVozIA-build14.apk filter=lfs diff=lfs merge=lfs -text
