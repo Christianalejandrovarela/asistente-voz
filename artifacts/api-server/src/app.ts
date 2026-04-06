@@ -33,8 +33,9 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 app.use("/api", router);
 
-// Serve the latest APK build for direct download (always picks the newest file)
-app.get("/download/apk", (_req, res) => {
+// APK download — must be under /api/ so the Replit workspace proxy forwards it
+// Accessible at: /api/download/apk
+app.get("/api/download/apk", (_req, res) => {
   const downloadsDir = "/home/runner/workspace/downloads";
   let latestApk: string | null = null;
   let latestMtime = 0;
