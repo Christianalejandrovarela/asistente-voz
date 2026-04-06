@@ -13,6 +13,11 @@ export const openai = new OpenAI({
 
 export type AudioFormat = "wav" | "mp3" | "webm" | "mp4" | "ogg" | "unknown";
 
+export type ConversationHistoryEntry = {
+  role: "user" | "assistant";
+  text: string;
+};
+
 /**
  * Detect audio format from buffer magic bytes.
  * Supports: WAV, MP3, WebM (Chrome/Firefox), MP4/M4A/MOV (Safari/iOS), OGG
@@ -96,25 +101,55 @@ export async function ensureCompatibleFormat(
   return { buffer: wavBuffer, format: "wav" };
 }
 
-/** Voice Chat: audio-in, audio-out using gpt-audio. */
+/** Voice Chat: audio-in, audio-out using gpt-4o-audio-preview. Supports conversation history and system prompt. */
 export async function voiceChat(
   audioBuffer: Buffer,
   voice: "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer" = "alloy",
   inputFormat: "wav" | "mp3" = "wav",
-  outputFormat: "wav" | "mp3" = "mp3"
+  outputFormat: "wav" | "mp3" = "mp3",
+  history: ConversationHistoryEntry[] = [],
+  systemPrompt?: string
 ): Promise<{ transcript: string; audioResponse: Buffer }> {
   const audioBase64 = audioBuffer.toString("base64");
+
+  const today = new Date().toLocaleDateString("es-ES", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+
+  const defaultSystem = `Eres un asistente de voz útil y amigable. Siempre responde en español, sin importar el idioma en que te hablen. La fecha de hoy es ${today}.`;
+  const system = systemPrompt
+    ? `${systemPrompt}\n\nLa fecha de hoy es ${today}.`
+    : defaultSystem;
+
+  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: "system", content: system },
+  ];
+
+  for (const entry of history) {
+    if (entry.role === "user") {
+      messages.push({ role: "user", content: entry.text });
+    } else {
+      messages.push({ role: "assistant", content: entry.text });
+    }
+  }
+
+  messages.push({
+    role: "user",
+    content: [
+      { type: "input_audio", input_audio: { data: audioBase64, format: inputFormat } },
+    ],
+  });
+
   const response = await openai.chat.completions.create({
     model: "gpt-audio",
     modalities: ["text", "audio"],
     audio: { voice, format: outputFormat },
-    messages: [{
-      role: "user",
-      content: [
-        { type: "input_audio", input_audio: { data: audioBase64, format: inputFormat } },
-      ],
-    }],
+    messages,
   });
+
   const message = response.choices[0]?.message as any;
   const transcript = message?.audio?.transcript || message?.content || "";
   const audioData = message?.audio?.data ?? "";
@@ -204,15 +239,17 @@ export async function textToSpeechStream(
   })();
 }
 
-/** Speech-to-Text using gpt-4o-mini-transcribe. */
+/** Speech-to-Text using gpt-4o-transcribe (supports language hint). */
 export async function speechToText(
   audioBuffer: Buffer,
-  format: "wav" | "mp3" | "webm" = "wav"
+  format: "wav" | "mp3" | "webm" = "wav",
+  language?: string
 ): Promise<string> {
   const file = await toFile(audioBuffer, `audio.${format}`);
   const response = await openai.audio.transcriptions.create({
     file,
-    model: "gpt-4o-mini-transcribe",
+    model: "gpt-4o-transcribe",
+    ...(language ? { language } : {}),
   });
   return response.text;
 }
@@ -220,13 +257,15 @@ export async function speechToText(
 /** Streaming Speech-to-Text. */
 export async function speechToTextStream(
   audioBuffer: Buffer,
-  format: "wav" | "mp3" | "webm" = "wav"
+  format: "wav" | "mp3" | "webm" = "wav",
+  language?: string
 ): Promise<AsyncIterable<string>> {
   const file = await toFile(audioBuffer, `audio.${format}`);
   const stream = await openai.audio.transcriptions.create({
     file,
-    model: "gpt-4o-mini-transcribe",
+    model: "gpt-4o-transcribe",
     stream: true,
+    ...(language ? { language } : {}),
   });
 
   return (async function* () {
