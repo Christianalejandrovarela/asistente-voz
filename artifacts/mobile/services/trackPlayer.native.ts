@@ -1,6 +1,4 @@
 import * as FileSystem from "expo-file-system/legacy";
-import { Audio } from "expo-av";
-import { Platform } from "react-native";
 
 let isInitialized = false;
 let unsubPlay: (() => void) | null = null;
@@ -106,27 +104,6 @@ export async function setupTrackPlayer(
 
       isInitialized = true;
       console.log("[TrackPlayer] Initialized, media session active");
-
-      // ── Fix 3: Pre-warm the audio session for background operation ──────────
-      // Setting staysActiveInBackground NOW (while the app is in the foreground)
-      // reserves the audio session on Android/iOS so that when the screen turns
-      // off and the user presses the headphone button, expo-av can start
-      // recording immediately without being blocked by Android 12+ background
-      // microphone restrictions.
-      try {
-        await Audio.setAudioModeAsync({
-          allowsRecordingIOS: true,
-          playsInSilentModeIOS: true,
-          ...(Platform.OS === "android" ? {
-            staysActiveInBackground: true,
-            shouldDuckAndroid: false,
-            playThroughEarpieceAndroid: false,
-          } : {}),
-        });
-        console.log("[TrackPlayer] Audio session pre-warmed for background recording");
-      } catch (audioErr) {
-        console.warn("[TrackPlayer] Audio pre-warm failed:", audioErr);
-      }
     }
 
     if (unsubPlay) unsubPlay();
