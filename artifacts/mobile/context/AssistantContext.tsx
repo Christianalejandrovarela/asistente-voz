@@ -264,13 +264,14 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       clearFollowUpTimer();
       await RollingBufferManager.pause();
       await pauseSilentTrack();
-      // Brief delay so RNTP fully releases audio focus before recording starts
-      await new Promise((r) => setTimeout(r, 150));
 
+      // setAudioModeAsync with shouldDuckAndroid:false instructs Android to
+      // steal exclusive audio focus from RNTP synchronously — no arbitrary
+      // delay needed. staysActiveInBackground keeps the session alive after
+      // the screen turns off so the mic stays open throughout the session.
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
-        // Android-specific — skip on web to avoid unsupported-option errors
         ...(Platform.OS === "android" ? {
           staysActiveInBackground: true,
           shouldDuckAndroid: false,

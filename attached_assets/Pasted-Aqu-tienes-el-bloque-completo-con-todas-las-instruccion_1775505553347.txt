@@ -1,0 +1,13 @@
+Aquí tienes el bloque completo con todas las instrucciones técnicas consolidadas. Solo tienes que copiar el texto que está dentro del recuadro y pegarlo directamente en el chat de tu Agente en Replit:
+
+"Necesito que apliques las siguientes correcciones arquitectónicas para solucionar los errores de ciclo de vida nativo, foco de audio y restricciones de background (Doze Mode) en Android:
+
+1. Bug 1 (Error de TrackPlayer.setupPlayer): El estado nativo sobrevive al estado de React. No confíes en la variable JS isInitialized. Envuelve TrackPlayer.setupPlayer() en un bloque try/catch. Si el catch detecta que el reproductor ya está inicializado (o si usas TrackPlayer.getState()), simplemente ignora el error, asume que está listo y continúa, en lugar de crashear.
+
+2. Bug 2 (Foco de audio y Error de Micrófono): Elimina el setTimeout (delay mágico de 150ms). Para liberar el foco de audio correctamente, configura Audio.setAudioModeAsync con la propiedad interruptionModeAndroid: Audio.INTERRUPTION_MODE_ANDROID_DO_NOT_MIX (o su equivalente actual en expo-av). Esto obligará a Android a robar el foco síncronamente a RNTP sin depender de retrasos.
+
+3. Bugs 2 y 3 (Restricción de Micrófono en Background): Por las reglas de privacidad de Android 11+, el acceso al hardware de grabación se deniega si se inicia desde background. Para solucionarlo, el Foreground Service (react-native-background-actions) con el tipo microphone debe iniciarse explícitamente mientras la app está abierta en pantalla (primer plano). Si TrackPlayer mantiene los medios vivos pero el servicio de micrófono no se pre-aprobó en foreground, Android bloqueará Audio.Recording.createAsync().
+
+4. Feedback de audio con pantalla apagada: El hilo de React (AssistantContext) se suspende con la pantalla apagada. Importa expo-av directamente dentro del headless task (trackPlayerService.native.ts). Al recibir Event.RemotePlay, instancia un sonido de 'beep' con Audio.Sound.createAsync(), reprodúcelo ahí mismo y, una vez terminado, llama a emitRemoteToggle(). Esto asegura que el usuario escuche la confirmación incluso si la UI está congelada.
+
+Por favor, implementa estos 4 ajustes en el código fuente para estabilizar el apk."

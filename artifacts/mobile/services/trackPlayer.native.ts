@@ -68,9 +68,19 @@ export async function setupTrackPlayer(
 
     if (!isInitialized) {
       console.log("[TrackPlayer] Setting up player...");
-      await TrackPlayer.setupPlayer({
-        autoHandleInterruptions: true,
-      });
+      // The native player state survives React restarts — PlaybackService may
+      // have already called setupPlayer() in its headless JS context.
+      // Catch "already initialized" errors and continue instead of crashing.
+      try {
+        await TrackPlayer.setupPlayer({ autoHandleInterruptions: true });
+      } catch (setupErr) {
+        const msg = setupErr instanceof Error ? setupErr.message : String(setupErr);
+        if (/already/i.test(msg) || /initialized/i.test(msg)) {
+          console.log("[TrackPlayer] setupPlayer: already initialized — continuing");
+        } else {
+          throw setupErr;
+        }
+      }
       await TrackPlayer.updateOptions({
         capabilities: [
           Capability.Play,
