@@ -33,17 +33,28 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 app.use("/api", router);
 
-// Serve the latest APK build for direct download
+// Serve the latest APK build for direct download (always picks the newest file)
 app.get("/download/apk", (_req, res) => {
-  const apkPath = path.resolve("/home/runner/workspace/downloads/AsistenteVozIA-build14.apk");
-  if (!fs.existsSync(apkPath)) {
-    res.status(404).json({ error: "APK not found" });
+  const downloadsDir = "/home/runner/workspace/downloads";
+  let latestApk: string | null = null;
+  let latestMtime = 0;
+  try {
+    for (const f of fs.readdirSync(downloadsDir)) {
+      if (!f.endsWith(".apk")) continue;
+      const full = path.join(downloadsDir, f);
+      const mtime = fs.statSync(full).mtimeMs;
+      if (mtime > latestMtime) { latestMtime = mtime; latestApk = full; }
+    }
+  } catch {}
+  if (!latestApk) {
+    res.status(404).json({ error: "No APK available yet" });
     return;
   }
+  const filename = path.basename(latestApk);
   res.setHeader("Content-Type", "application/vnd.android.package-archive");
-  res.setHeader("Content-Disposition", 'attachment; filename="AsistenteVozIA-build14.apk"');
-  res.setHeader("Content-Length", fs.statSync(apkPath).size);
-  fs.createReadStream(apkPath).pipe(res);
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  res.setHeader("Content-Length", fs.statSync(latestApk).size);
+  fs.createReadStream(latestApk).pipe(res);
 });
 
 export default app;
