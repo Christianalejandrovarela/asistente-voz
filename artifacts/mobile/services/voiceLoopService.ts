@@ -27,6 +27,7 @@ import {
 } from "@/services/conversationDb";
 import { pauseSilentTrack, resumeSilentTrack } from "@/services/trackPlayer";
 import { RollingBufferManager } from "@/services/rollingBufferManager";
+import { rlog, rwarn, rerror } from "@/services/remoteLogger";
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -229,14 +230,18 @@ async function startListening(isFollowUp = false): Promise<void> {
   // MUTEX: Prevent concurrent microphone-setup attempts.
   // In JS there are no thread pre-emptions, so this check+set is atomic.
   if (_isMicrophoneBusy) {
+    rwarn("MUTEX", `BLOCKED — _isMicrophoneBusy=true, rejecting concurrent startListening (status=${_status})`);
     emitDebug("Mic busy — ignoring concurrent startListening call");
     return;
   }
   _isMicrophoneBusy = true;  // Lock the hardware mic
+  rlog("MUTEX", `ACQUIRED — _isMicrophoneBusy=true (isFollowUp=${isFollowUp})`);
 
   try {
     const { status: permStatus } = await Audio.requestPermissionsAsync();
+    rlog("MIC", `requestPermissionsAsync → ${permStatus}`);
     if (permStatus !== "granted") {
+      rerror("MIC", "Permission NOT granted — stopping session");
       emitError(
         "Permiso de micrófono",
         "Para usar el asistente necesitas conceder acceso al micrófono en los ajustes."
@@ -251,7 +256,9 @@ async function startListening(isFollowUp = false): Promise<void> {
     await pauseSilentTrack();
 
     // Guarantee all recording objects are released before createAsync.
+    rlog("MIC", "forceCleanupAllRecordings() start");
     await forceCleanupAllRecordings();
+    rlog("MIC", "forceCleanupAllRecordings() done — about to createAsync()");
 
     // Claim exclusive audio focus for recording.
     await Audio.setAudioModeAsync({
@@ -264,11 +271,13 @@ async function startListening(isFollowUp = false): Promise<void> {
       } : {}),
     });
 
+    rlog("MIC", "Audio.Recording.createAsync() → opening hardware mic...");
     const { recording } = await Audio.Recording.createAsync(
       { ...Audio.RecordingOptionsPresets.HIGH_QUALITY, isMeteringEnabled: true },
       undefined,
       100
     );
+    rlog("MIC", "Audio.Recording.createAsync() ✓ — hardware mic is open");
 
     // Recording is live — mutex stays locked until sendCurrentRecording releases it.
     _recording = recording;
@@ -335,6 +344,8 @@ async function startListening(isFollowUp = false): Promise<void> {
     // Release mutex so retries can proceed
     _isMicrophoneBusy = false;
     const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    rerror("MIC", `createAsync FAILED (retry ${_micRetryCount + 1}/${MAX_MIC_RETRIES}): ${msg}`);
+    rlog("MUTEX", `RELEASED — error path (retry ${_micRetryCount + 1})`);
     _micRetryCount += 1;
     emitDebug(`Error mic (${_micRetryCount}/${MAX_MIC_RETRIES}): ${msg}`);
     setStatusSync("idle");
@@ -364,15 +375,18 @@ async function sendCurrentRecording(): Promise<void> {
   const recording = _recording;
   _recording = null;
 
+  rlog("MIC", "stopAndUnloadAsync() — releasing hardware mic...");
   try {
     await recording.stopAndUnloadAsync();
-  } catch {
-    // Even if stopAndUnload throws, the recording object is released — proceed
+    rlog("MIC", "stopAndUnloadAsync() ✓ — hardware mic released");
+  } catch (e) {
+    rwarn("MIC", `stopAndUnloadAsync() threw (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
   }
 
   // Hardware mic is now free — release the mutex before any await operations
   // so the next startListening() call can proceed after TTS playback finishes.
   _isMicrophoneBusy = false;
+  rlog("MUTEX", "RELEASED — mic hardware free, loop continues to API+TTS");
 
   const uri = recording.getURI();
 
@@ -408,6 +422,7 @@ async function sendCurrentRecording(): Promise<void> {
       }
     }
 
+    rlog("API", `fetch → ${apiUrl}`);
     _abortCtrl = new AbortController();
     const response = await fetch(apiUrl, {
       method: "POST",
@@ -465,11 +480,15 @@ async function sendCurrentRecording(): Promise<void> {
       return;
     }
 
+    rlog("API", `response OK — userText="${data.userText.slice(0,60)}" assistText="${data.assistantText.slice(0,60)}"`);
     setStatusSync("speaking");
+    rlog("TTS", "playResponseAudio() start");
     await playResponseAudio(data.audio);
+    rlog("TTS", "playResponseAudio() done");
 
     if (_isActive) {
       setStatusSync("idle");
+      rlog("LOOP", "TTS done, _isActive=true → startListening(followUp)");
       // Gemini Live-style: mic reopens automatically after AI responds
       void startListening(true);
     } else {
@@ -498,6 +517,7 @@ async function sendCurrentRecording(): Promise<void> {
 /** Start a new voice session (record → API → TTS → loop). */
 export async function startVoiceLoop(): Promise<void> {
   if (_isActive) return;
+  rlog("LOOP", "startVoiceLoop() — _isActive=false → starting session");
   _isActive = true;
   _micRetryCount = 0;
 
@@ -515,6 +535,7 @@ export async function startVoiceLoop(): Promise<void> {
 /** Stop the current voice session and clean up all resources. */
 export async function stopVoiceLoop(): Promise<void> {
   if (!_isActive) return;
+  rlog("LOOP", `stopVoiceLoop() — status=${_status} micBusy=${_isMicrophoneBusy}`);
   _isActive = false;
   _isMicrophoneBusy = false;  // Emergency reset of the hardware lock
   DeviceEventEmitter.emit(VL_SESSION, { active: false });

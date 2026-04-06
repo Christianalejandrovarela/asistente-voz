@@ -10,6 +10,13 @@
  *
  * Metro automatically picks index.native.ts over index.ts on iOS/Android.
  */
+// ─── 0. Remote logger MUST be initialized first ──────────────────────────────
+// Patches console.log/warn/error so [VoiceLoop], [PlaybackService] lines are
+// forwarded to the Replit server log in real-time.
+import { initRemoteLogger, rlog } from "./services/remoteLogger";
+initRemoteLogger();
+rlog("BOOT", "index.native.ts loaded — remote logging active");
+
 import TrackPlayer from "react-native-track-player";
 import { PlaybackService } from "./services/trackPlayerService.native";
 

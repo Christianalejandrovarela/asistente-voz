@@ -1,5 +1,6 @@
 import TrackPlayer, { Event } from "react-native-track-player";
 import { toggleVoiceLoop } from "./voiceLoopService";
+import { rlog, rwarn } from "./remoteLogger";
 
 /**
  * Generates a short 440 Hz sine-wave beep as a base64-encoded WAV string.
@@ -67,6 +68,7 @@ function generateBeepWavBase64(
  */
 async function playConfirmationBeep(): Promise<void> {
   try {
+    rlog("BT", "playConfirmationBeep() start");
     const FileSystem = await import("expo-file-system/legacy");
     const { Audio } = await import("expo-av");
 
@@ -88,8 +90,10 @@ async function playConfirmationBeep(): Promise<void> {
       });
       setTimeout(resolve, 1500); // safety timeout
     });
+    rlog("BT", "playConfirmationBeep() done");
   } catch (err) {
     console.warn("[PlaybackService] Beep failed (non-fatal):", err);
+    rwarn("BT", `playConfirmationBeep() FAILED: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -109,11 +113,14 @@ let _lastToggleMs = 0;
 
 async function handleToggleEvent(label: string): Promise<void> {
   const now = Date.now();
-  if (now - _lastToggleMs < TOGGLE_DEBOUNCE_MS) {
-    console.log(`[PlaybackService] ${label} debounced — ignored (${now - _lastToggleMs} ms since last)`);
+  const delta = now - _lastToggleMs;
+  if (delta < TOGGLE_DEBOUNCE_MS) {
+    rwarn("BT", `${label} DEBOUNCED — ${delta}ms < ${TOGGLE_DEBOUNCE_MS}ms threshold, ignored`);
+    console.log(`[PlaybackService] ${label} debounced — ignored (${delta} ms since last)`);
     return;
   }
   _lastToggleMs = now;
+  rlog("BT", `${label} ACCEPTED — delta=${delta}ms, calling toggleVoiceLoop()`);
   console.log(`[PlaybackService] ${label} accepted`);
   await playConfirmationBeep();
   toggleVoiceLoop();

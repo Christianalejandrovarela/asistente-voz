@@ -33,6 +33,26 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 app.use("/api", router);
 
+// ─── Remote log endpoint ──────────────────────────────────────────────────────
+// The Android APK sends critical lifecycle events here (fire-and-forget HTTP).
+// Print them to stdout with a clear prefix so they appear in the Replit
+// workflow console in real-time — acting as a "cardiac monitor" for the app.
+app.post("/api/remote-log", (req, res) => {
+  const { level = "LOG", tag = "?", message = "", ts } = req.body as {
+    level?: string;
+    tag?: string;
+    message?: string;
+    ts?: number;
+  };
+  const time = ts
+    ? new Date(ts).toISOString().replace("T", " ").replace("Z", "")
+    : new Date().toISOString().replace("T", " ").replace("Z", "");
+  const icon = level === "ERROR" ? "❌" : level === "WARN" ? "⚠️ " : "📱";
+  // Use process.stdout.write to bypass pino formatting and always be visible
+  process.stdout.write(`${icon} [APP ANDROID][${tag}] ${message}  (${time})\n`);
+  res.status(200).json({ ok: true });
+});
+
 // APK download — must be under /api/ so the Replit workspace proxy forwards it
 // Accessible at: /api/download/apk
 app.get("/api/download/apk", (_req, res) => {
