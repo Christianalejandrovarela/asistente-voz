@@ -6,6 +6,7 @@ import { Alert, Platform } from "react-native";
 
 import { setupTrackPlayer, destroyTrackPlayer, pauseSilentTrack, resumeSilentTrack } from "@/services/trackPlayer";
 import { startBackgroundService, stopBackgroundService } from "@/services/backgroundService";
+import { requestBatteryOptimizationExemption } from "@/services/androidBatteryOptimization";
 import { initDb, getMessages, addMessage, clearMessages, startAutoPurge, stopAutoPurge, purgeOldMessages } from "@/services/conversationDb";
 import { RollingBufferManager } from "@/services/rollingBufferManager";
 import { onBluetoothDisconnect } from "@/services/bluetoothAudio";
@@ -210,6 +211,9 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         AsyncStorage.getItem(SETTINGS_KEY),
         AsyncStorage.getItem(CONTEXT_SUMMARY_KEY),
       ]);
+      // Request Doze Mode exemption on Android so the JS thread is never
+      // throttled/paused while the screen is off.  Non-blocking — shown once.
+      void requestBatteryOptimizationExemption();
       setMessages(storedMsgs);
       if (storedSettings) {
         setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(storedSettings) as Partial<AssistantSettings> });
