@@ -232,10 +232,15 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
       await RollingBufferManager.pause();
       await pauseSilentTrack();
+      // Brief delay so RNTP fully releases audio focus before recording starts
+      await new Promise((r) => setTimeout(r, 150));
 
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
+        staysActiveInBackground: true,
+        shouldDuckAndroid: false,
+        playThroughEarpieceAndroid: false,
       });
 
       const { recording } = await Audio.Recording.createAsync(
@@ -290,12 +295,14 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         }
       }, MAX_RECORDING_MS);
     } catch (err) {
-      console.error("[VoiceAssistant] Error starting listening:", err);
+      const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      console.error("[VoiceAssistant] Error starting listening:", msg);
+      setDebugInfo(`Error mic: ${msg}`);
       setStatusSync("idle");
       await RollingBufferManager.resume();
       await resumeSilentTrack();
       if (isSessionActiveRef.current) {
-        setTimeout(() => { void startListeningFn(); }, 500);
+        setTimeout(() => { void startListeningFn(); }, 1000);
       }
     }
   };

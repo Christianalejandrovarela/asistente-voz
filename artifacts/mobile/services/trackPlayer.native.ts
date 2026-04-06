@@ -110,22 +110,18 @@ export async function setupTrackPlayer(
     if (unsubPause) unsubPause();
     if (unsubToggle) unsubToggle();
 
-    const playSubscription = TrackPlayer.addEventListener(Event.RemotePlay, () => {
-      console.log("[TrackPlayer] EVENT: RemotePlay received from headset");
-      onPlay();
-    });
-    const pauseSubscription = TrackPlayer.addEventListener(Event.RemotePause, () => {
-      console.log("[TrackPlayer] EVENT: RemotePause received from headset");
-      onPause();
-    });
-
-    unsubPlay = () => playSubscription.remove();
-    unsubPause = () => pauseSubscription.remove();
-
+    // NOTE: Do NOT register RemotePlay/RemotePause listeners here.
+    // PlaybackService (headless) already handles them via emitRemoteToggle.
+    // Registering here AND in PlaybackService causes double-toggle (cancels itself).
+    // We only listen via the toggle event bus from PlaybackService.
     if (onToggle) {
       const { onRemoteToggle } = await import("./trackPlayerEvents");
       unsubToggle = onRemoteToggle(onToggle);
     }
+
+    // Store callbacks in case they are needed later
+    unsubPlay = () => {};
+    unsubPause = () => {};
 
     return true;
   } catch (err) {
