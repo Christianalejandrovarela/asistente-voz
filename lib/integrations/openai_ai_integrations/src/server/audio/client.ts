@@ -101,6 +101,36 @@ export async function ensureCompatibleFormat(
   return { buffer: wavBuffer, format: "wav" };
 }
 
+/**
+ * Compress a conversation history into a structured summary using gpt-4o-mini.
+ * Called when history grows long to avoid token limit issues.
+ * Runs in parallel with voiceChat so it adds zero latency.
+ */
+export async function compressContext(history: ConversationHistoryEntry[]): Promise<string> {
+  const historyText = history
+    .map((h) => `${h.role === "user" ? "Usuario" : "Asistente"}: ${h.text}`)
+    .join("\n");
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "system",
+        content:
+          "Eres un asistente especializado en resumir conversaciones de voz en español de forma estructurada y concisa.",
+      },
+      {
+        role: "user",
+        content:
+          `Resume esta conversación capturando: (1) temas principales tratados, (2) información personal del usuario mencionada (nombre, preferencias, contexto de vida), (3) decisiones o tareas pendientes, (4) hilo narrativo y estado actual de la conversación.\n\nConversación:\n${historyText}\n\nResumen estructurado (solo el resumen, sin preámbulos):`,
+      },
+    ],
+    max_tokens: 600,
+  });
+
+  return response.choices[0]?.message?.content ?? "";
+}
+
 /** Voice Chat: audio-in, audio-out using gpt-4o-audio-preview. Supports conversation history and system prompt. */
 export async function voiceChat(
   audioBuffer: Buffer,

@@ -6,6 +6,7 @@ export {
   type AudioFormat,
   voiceChat,
   voiceChatStream,
+  compressContext,
   textToSpeech,
   textToSpeechStream,
   speechToText,

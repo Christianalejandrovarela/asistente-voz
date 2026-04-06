@@ -8,6 +8,7 @@ export {
   type ConversationHistoryEntry,
   voiceChat,
   voiceChatStream,
+  compressContext,
   textToSpeech,
   textToSpeechStream,
   speechToText,

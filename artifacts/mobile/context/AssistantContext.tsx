@@ -16,6 +16,9 @@ interface VoiceApiResponse {
   audio: string;
   userText: string;
   assistantText: string;
+  /** Returned when the server compressed the history (every ~7 turns).
+   *  Client should store this, clear SQLite history, and send it on future calls. */
+  newContextSummary?: string;
 }
 
 export interface ChatMessage {
@@ -55,6 +58,7 @@ const AssistantContext = createContext<AssistantContextValue | null>(null);
 
 const SETTINGS_KEY = "@voice_assistant_settings";
 const ROLLING_BUFFER_KEY = "@rolling_buffer_active";
+const CONTEXT_SUMMARY_KEY = "@context_summary";
 
 const DEFAULT_SETTINGS: AssistantSettings = { voice: "nova", language: "es" };
 
@@ -104,6 +108,9 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const maxRecordingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const followUpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settingsRef = useRef<AssistantSettings>(DEFAULT_SETTINGS);
+  // Compressed summary of previous conversation turns.
+  // Persisted to AsyncStorage; sent with each API request so context survives session restarts.
+  const contextSummaryRef = useRef<string>("");
 
   // Sync setter: updates the ref immediately (same tick) so guards that read
   // statusRef.current right after a setStatus call see the new value at once,
@@ -195,13 +202,17 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const loadStoredData = async () => {
     try {
       await initDb();
-      const [storedMsgs, storedSettings] = await Promise.all([
+      const [storedMsgs, storedSettings, storedSummary] = await Promise.all([
         getMessages(200),
         AsyncStorage.getItem(SETTINGS_KEY),
+        AsyncStorage.getItem(CONTEXT_SUMMARY_KEY),
       ]);
       setMessages(storedMsgs);
       if (storedSettings) {
         setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(storedSettings) as Partial<AssistantSettings> });
+      }
+      if (storedSummary) {
+        contextSummaryRef.current = storedSummary;
       }
     } catch {}
   };
@@ -396,7 +407,9 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
           audio: base64Audio,
           voice: currentSettings.voice,
           language: currentSettings.language,
-          history: historyPayload.slice(-20),
+          history: historyPayload.slice(-30),
+          // Compressed summary from a previous compression cycle (may be empty)
+          contextSummary: contextSummaryRef.current || undefined,
         }),
         signal: abortControllerRef.current.signal,
       });
@@ -416,6 +429,17 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
       const data = await response.json() as VoiceApiResponse;
       const now = Date.now();
+
+      // Context compression: server compressed the history into a summary.
+      // Clear SQLite chat history, store the new summary for future requests.
+      if (data.newContextSummary) {
+        console.log("[VoiceAssistant] Context compressed — resetting local history");
+        contextSummaryRef.current = data.newContextSummary;
+        await clearMessages();
+        setMessages([]);
+        void AsyncStorage.setItem(CONTEXT_SUMMARY_KEY, data.newContextSummary);
+      }
+
       addMessages([
         { id: generateId(), role: "user", text: data.userText, timestamp: now },
         { id: generateId(), role: "assistant", text: data.assistantText, timestamp: now + 1 },
@@ -636,7 +660,9 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
   const clearHistory = useCallback(() => {
     setMessages([]);
+    contextSummaryRef.current = "";
     void clearMessages();
+    void AsyncStorage.removeItem(CONTEXT_SUMMARY_KEY);
   }, []);
 
   const updateSettings = useCallback((newSettings: Partial<AssistantSettings>) => {
