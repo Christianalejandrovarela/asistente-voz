@@ -1,3 +1,4 @@
 downloads/app-preview.apk filter=lfs diff=lfs merge=lfs -text
 downloads/AsistenteVozIA-build14.apk filter=lfs diff=lfs merge=lfs -text
 downloads/AsistenteVozIA-build16.apk filter=lfs diff=lfs merge=lfs -text
+downloads/asistente-voz-build22.apk filter=lfs diff=lfs merge=lfs -text
