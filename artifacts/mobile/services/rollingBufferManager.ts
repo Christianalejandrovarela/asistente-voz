@@ -119,9 +119,20 @@ class RollingBufferManagerImpl {
         staysActiveInBackground: true,
       });
 
+      // Re-check after every await: pause() may have been called while we waited.
+      if (!this.running || this.paused) return;
+
       const { recording } = await Audio.Recording.createAsync(
         Audio.RecordingOptionsPresets.LOW_QUALITY
       );
+
+      // Re-check again: if we were paused while createAsync() was in flight,
+      // release the recording immediately so the voice loop can have the mic.
+      if (!this.running || this.paused) {
+        try { await recording.stopAndUnloadAsync(); } catch {}
+        return;
+      }
+
       this.currentRecording = recording;
       this.currentSegmentStartedAt = Date.now();
 
@@ -132,6 +143,7 @@ class RollingBufferManagerImpl {
     } catch (err) {
       console.warn("[RollingBuffer] Failed to start segment:", err);
       this.currentRecording = null;
+      // Only retry if still active — do NOT retry while paused.
       if (this.running && !this.paused) {
         this.segmentTimer = setTimeout(() => {
           void this._startSegment();
