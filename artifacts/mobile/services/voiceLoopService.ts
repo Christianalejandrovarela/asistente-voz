@@ -70,7 +70,6 @@ const CONTEXT_SUMMARY_KEY = "@context_summary";
 let _isActive       = false;
 let _status: VoiceLoopStatus = "idle";
 let _recording:    Audio.Recording | null = null;
-let _bargeInRec:   Audio.Recording | null = null;
 let _sound:        Audio.Sound | null = null;
 let _abortCtrl:    AbortController | null = null;
 let _maxTimer:     ReturnType<typeof setTimeout> | null = null;
@@ -78,6 +77,22 @@ let _followUpTimer: ReturnType<typeof setTimeout> | null = null;
 let _micRetryCount = 0;
 let _playbackResolve: (() => void) | null = null;
 let _contextSummary = "";
+
+/**
+ * MUTEX — Hardware microphone lock.
+ *
+ * Set to true synchronously (no await in between check and set) at the very
+ * beginning of startListening() BEFORE any async operation that touches the
+ * recording hardware.  Cleared only when:
+ *   1. startListening() catches an error (mic failed to open)
+ *   2. sendCurrentRecording() finishes stopAndUnloadAsync() (hardware freed)
+ *   3. stopVoiceLoop() is called (emergency reset)
+ *
+ * Prevents the "Only one Recording object can be prepared at a given time"
+ * error that arises when the Bluetooth button fires multiple events in rapid
+ * succession or a retry races with an in-progress setup.
+ */
+let _isMicrophoneBusy = false;
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -116,13 +131,11 @@ async function getSettings(): Promise<{ voice: string; language: string }> {
 }
 
 /**
- * FIX 1 — Robust Recording Cleanup.
+ * Robust Recording Cleanup.
  *
- * Before EVERY Audio.Recording.createAsync() call we force-stop and unload
- * ALL existing recording objects.  Prevents the fatal:
- *   "Only one Recording object can be prepared at a given time"
- * which occurs when the barge-in or main recording is not cleaned up between
- * turns (e.g. stopAndUnloadAsync() threw and was silently swallowed).
+ * Stops and unloads the main recording AND any recording the RollingBuffer
+ * Manager may have started after pause() returned (race condition where a
+ * segment timer fires in the pause gap).  Called before EVERY createAsync().
  */
 async function forceCleanupAllRecordings(): Promise<void> {
   if (_recording !== null) {
@@ -131,19 +144,21 @@ async function forceCleanupAllRecordings(): Promise<void> {
     _recording = null;
     try { r.setOnRecordingStatusUpdate(null); await r.stopAndUnloadAsync(); } catch {}
   }
-  if (_bargeInRec !== null) {
-    emitDebug("Force-cleaning orphaned barge-in recording");
-    const r = _bargeInRec;
-    _bargeInRec = null;
-    try { r.setOnRecordingStatusUpdate(null); await r.stopAndUnloadAsync(); } catch {}
-  }
+  // Also stop any recording the RollingBufferManager may have started between
+  // the pause() call returning and createAsync() being invoked.
+  try { await RollingBufferManager.forceStopRecording(); } catch {}
 }
 
 async function readUriAsBase64(uri: string): Promise<string> {
   return FileSystem.readAsStringAsync(uri, { encoding: "base64" });
 }
 
-// ─── Audio playback ───────────────────────────────────────────────────────────
+// ─── Audio playback (strict sequential — no barge-in) ─────────────────────────
+//
+// expo-av is unstable when an Audio.Recording object is active while an
+// Audio.Sound is playing on the same hardware.  The barge-in feature has
+// been removed.  The flow is now strictly:
+//   Record → stop/unload → API → TTS play → stop/unload → Record …
 
 async function playResponseAudio(base64Audio: string): Promise<void> {
   // Clean up any leftover sound from a previous turn
@@ -153,7 +168,7 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
     _sound = null;
   }
 
-  // Always configure audio mode before playback
+  // Configure audio mode for playback
   await Audio.setAudioModeAsync({
     allowsRecordingIOS: true,
     playsInSilentModeIOS: true,
@@ -192,47 +207,10 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
     );
     _sound = sound;
 
-    // ── Barge-in: open mic monitor while AI speaks ─────────────────────────
-    // Use try/finally to GUARANTEE cleanup even if the inner code throws.
-    try {
-      // Force-cleanup any stale recordings before opening barge-in mic
-      await forceCleanupAllRecordings();
-
-      const { recording } = await Audio.Recording.createAsync(
-        { ...Audio.RecordingOptionsPresets.HIGH_QUALITY, isMeteringEnabled: true },
-        undefined,
-        80
-      );
-      _bargeInRec = recording;
-      let speechStart: number | null = null;
-
-      recording.setOnRecordingStatusUpdate((s) => {
-        if (!s.isRecording || !_isActive) return;
-        const db = s.metering ?? -160;
-        if (db > VAD_SILENCE_THRESHOLD_DB) {
-          if (!speechStart) speechStart = Date.now();
-          if (Date.now() - speechStart >= VAD_MIN_SPEECH_MS) {
-            recording.setOnRecordingStatusUpdate(null);
-            resolvePlayback(); // barge-in: interrupt AI speech
-          }
-        } else {
-          speechStart = null;
-        }
-      });
-    } catch {
-      // Barge-in unavailable — continue without it
-    }
-
     // Safety-net: unblock after 3 min if status callback never fires
     const safetyTimeout = new Promise<void>((res) => setTimeout(res, 3 * 60 * 1000));
     await Promise.race([playbackDone, safetyTimeout]);
 
-    // ── Always clean up barge-in and sound ────────────────────────────────
-    if (_bargeInRec !== null) {
-      const r = _bargeInRec;
-      _bargeInRec = null;
-      try { r.setOnRecordingStatusUpdate(null); await r.stopAndUnloadAsync(); } catch {}
-    }
     _playbackResolve = null;
     try { await sound.stopAsync();   } catch {}
     try { await sound.unloadAsync(); } catch {}
@@ -248,6 +226,14 @@ async function startListening(isFollowUp = false): Promise<void> {
   if (!_isActive) return;
   if (_status !== "idle") return;
 
+  // MUTEX: Prevent concurrent microphone-setup attempts.
+  // In JS there are no thread pre-emptions, so this check+set is atomic.
+  if (_isMicrophoneBusy) {
+    emitDebug("Mic busy — ignoring concurrent startListening call");
+    return;
+  }
+  _isMicrophoneBusy = true;  // Lock the hardware mic
+
   try {
     const { status: permStatus } = await Audio.requestPermissionsAsync();
     if (permStatus !== "granted") {
@@ -255,6 +241,7 @@ async function startListening(isFollowUp = false): Promise<void> {
         "Permiso de micrófono",
         "Para usar el asistente necesitas conceder acceso al micrófono en los ajustes."
       );
+      _isMicrophoneBusy = false;
       await stopVoiceLoop();
       return;
     }
@@ -263,11 +250,10 @@ async function startListening(isFollowUp = false): Promise<void> {
     await RollingBufferManager.pause();
     await pauseSilentTrack();
 
-    // FIX 1: Always force-cleanup ALL recording objects before createAsync.
-    // This prevents "Only one Recording object can be prepared at a given time".
+    // Guarantee all recording objects are released before createAsync.
     await forceCleanupAllRecordings();
 
-    // Steal exclusive audio focus from RNTP synchronously.
+    // Claim exclusive audio focus for recording.
     await Audio.setAudioModeAsync({
       allowsRecordingIOS: true,
       playsInSilentModeIOS: true,
@@ -284,6 +270,7 @@ async function startListening(isFollowUp = false): Promise<void> {
       100
     );
 
+    // Recording is live — mutex stays locked until sendCurrentRecording releases it.
     _recording = recording;
     _micRetryCount = 0;
     setStatusSync(isFollowUp ? "waiting" : "recording");
@@ -345,6 +332,8 @@ async function startListening(isFollowUp = false): Promise<void> {
     }, MAX_RECORDING_MS);
 
   } catch (err) {
+    // Release mutex so retries can proceed
+    _isMicrophoneBusy = false;
     const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
     _micRetryCount += 1;
     emitDebug(`Error mic (${_micRetryCount}/${MAX_MIC_RETRIES}): ${msg}`);
@@ -372,16 +361,18 @@ async function sendCurrentRecording(): Promise<void> {
   if ((_status !== "recording" && _status !== "waiting") || _recording === null) return;
   setStatusSync("processing");
 
-  // FIX 1: Use try/finally to guarantee recording cleanup on every path.
   const recording = _recording;
   _recording = null;
 
   try {
     await recording.stopAndUnloadAsync();
   } catch {
-    // Even if stopAndUnload throws, the recording object is released at this
-    // point — proceed with whatever URI was captured
+    // Even if stopAndUnload throws, the recording object is released — proceed
   }
+
+  // Hardware mic is now free — release the mutex before any await operations
+  // so the next startListening() call can proceed after TTS playback finishes.
+  _isMicrophoneBusy = false;
 
   const uri = recording.getURI();
 
@@ -525,6 +516,7 @@ export async function startVoiceLoop(): Promise<void> {
 export async function stopVoiceLoop(): Promise<void> {
   if (!_isActive) return;
   _isActive = false;
+  _isMicrophoneBusy = false;  // Emergency reset of the hardware lock
   DeviceEventEmitter.emit(VL_SESSION, { active: false });
 
   clearMaxTimer();

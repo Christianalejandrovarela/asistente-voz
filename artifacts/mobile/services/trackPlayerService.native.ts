@@ -93,30 +93,48 @@ async function playConfirmationBeep(): Promise<void> {
   }
 }
 
+/**
+ * DEBOUNCE — Bluetooth headset button guard.
+ *
+ * Physical headset buttons (and some Android BT stacks) fire the same remote
+ * event 2-3 times for a single press within ~200 ms.  Without debouncing this
+ * calls toggleVoiceLoop() multiple times, toggling the session on and off and
+ * leaving orphaned recording objects.
+ *
+ * Any event that arrives within TOGGLE_DEBOUNCE_MS of the last accepted event
+ * is silently ignored.
+ */
+const TOGGLE_DEBOUNCE_MS = 500;
+let _lastToggleMs = 0;
+
+async function handleToggleEvent(label: string): Promise<void> {
+  const now = Date.now();
+  if (now - _lastToggleMs < TOGGLE_DEBOUNCE_MS) {
+    console.log(`[PlaybackService] ${label} debounced — ignored (${now - _lastToggleMs} ms since last)`);
+    return;
+  }
+  _lastToggleMs = now;
+  console.log(`[PlaybackService] ${label} accepted`);
+  await playConfirmationBeep();
+  toggleVoiceLoop();
+}
+
 export async function PlaybackService(): Promise<void> {
   /**
-   * All headset button events call toggleVoiceLoop() directly.
-   *
-   * toggleVoiceLoop() lives in voiceLoopService.ts which uses MODULE-LEVEL
-   * state — the same JS runtime as the PlaybackService headless task. This
-   * means the full voice loop (mic → API → TTS → mic) runs independently of
-   * any React component lifecycle (FIX 2: Headless Loop).
-   *
-   * We play a beep FIRST so the user hears confirmation before the mic opens.
+   * All headset button events go through handleToggleEvent() which:
+   *  1. Debounces phantom presses (< 500 ms apart are ignored)
+   *  2. Plays a beep for audible feedback
+   *  3. Calls toggleVoiceLoop() in the same JS runtime as the full loop
    */
 
   TrackPlayer.addEventListener(Event.RemotePlay, async () => {
-    console.log("[PlaybackService] RemotePlay");
     void TrackPlayer.play();
-    await playConfirmationBeep();
-    toggleVoiceLoop();
+    await handleToggleEvent("RemotePlay");
   });
 
   TrackPlayer.addEventListener(Event.RemotePause, async () => {
-    console.log("[PlaybackService] RemotePause");
     void TrackPlayer.play(); // keep silent track alive
-    await playConfirmationBeep();
-    toggleVoiceLoop();
+    await handleToggleEvent("RemotePause");
   });
 
   TrackPlayer.addEventListener(Event.RemoteStop, () => {
@@ -126,15 +144,11 @@ export async function PlaybackService(): Promise<void> {
 
   /** Single-button headphones send RemoteNext on first press */
   TrackPlayer.addEventListener(Event.RemoteNext, async () => {
-    console.log("[PlaybackService] RemoteNext (headset single press)");
-    await playConfirmationBeep();
-    toggleVoiceLoop();
+    await handleToggleEvent("RemoteNext");
   });
 
   TrackPlayer.addEventListener(Event.RemotePrevious, async () => {
-    console.log("[PlaybackService] RemotePrevious (headset press)");
-    await playConfirmationBeep();
-    toggleVoiceLoop();
+    await handleToggleEvent("RemotePrevious");
   });
 
   TrackPlayer.addEventListener(Event.RemoteDuck, async (event) => {

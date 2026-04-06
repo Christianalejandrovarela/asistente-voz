@@ -103,25 +103,27 @@ export default function MainScreen() {
         </Pressable>
       </View>
 
-      <FlatList
-        ref={listRef}
-        data={reversedMessages}
-        keyExtractor={(item) => item.id}
-        renderItem={renderItem}
-        inverted
-        contentContainerStyle={styles.listContent}
-        showsVerticalScrollIndicator={false}
-        scrollEnabled={!!reversedMessages.length}
-        style={styles.list}
-        ListEmptyComponent={
-          <View style={styles.emptyState}>
+      <View style={styles.listWrapper}>
+        <FlatList
+          ref={listRef}
+          data={reversedMessages}
+          keyExtractor={(item) => item.id}
+          renderItem={renderItem}
+          inverted
+          contentContainerStyle={styles.listContent}
+          showsVerticalScrollIndicator={false}
+          scrollEnabled={!!reversedMessages.length}
+          style={styles.list}
+        />
+        {reversedMessages.length === 0 && (
+          <View style={styles.emptyState} pointerEvents="none">
             <Feather name="mic" size={28} color={colors.mutedForeground} />
             <Text style={[styles.emptyText, { color: colors.mutedForeground }]}>
               Toca el botón para iniciar{"\n"}una conversación
             </Text>
           </View>
-        }
-      />
+        )}
+      </View>
 
       <View style={styles.orbArea}>
         <Text style={[styles.statusLabel, { color: colors.mutedForeground }]}>
@@ -200,6 +202,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.8,
   },
   settingsBtn: { padding: 8 },
+  listWrapper: { flex: 1 },
   list: { flex: 1 },
   listContent: {
     paddingVertical: 8,
@@ -207,12 +210,15 @@ const styles = StyleSheet.create({
     justifyContent: "flex-end",
   },
   emptyState: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
     alignItems: "center",
     justifyContent: "center",
     gap: 12,
-    paddingVertical: 60,
     paddingHorizontal: 40,
-    transform: [{ scaleY: -1 }],
   },
   emptyText: {
     textAlign: "center",
