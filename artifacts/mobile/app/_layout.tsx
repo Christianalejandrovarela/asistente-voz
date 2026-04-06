@@ -15,7 +15,8 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { AssistantProvider } from "@/context/AssistantContext";
 
-import "@/services/initTrackPlayer";
+// TrackPlayer.registerPlaybackService is now called in index.native.ts
+// (global entry point) so it fires before any React component mounts.
 
 SplashScreen.preventAutoHideAsync();
 
