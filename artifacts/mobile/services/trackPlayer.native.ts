@@ -1,16 +1,9 @@
-import { NativeModules } from "react-native";
 import * as FileSystem from "expo-file-system/legacy";
-
-const NATIVE_MODULE_NAME = "TrackPlayerModule";
 
 let isInitialized = false;
 let unsubPlay: (() => void) | null = null;
 let unsubPause: (() => void) | null = null;
 let unsubToggle: (() => void) | null = null;
-
-function hasNativeModule(): boolean {
-  return !!NativeModules[NATIVE_MODULE_NAME];
-}
 
 function generateSilentWavBase64(): string {
   const sampleRate = 8000;
@@ -70,19 +63,15 @@ export async function setupTrackPlayer(
   onPause: () => void,
   onToggle?: () => void
 ): Promise<boolean> {
-  if (!hasNativeModule()) {
-    console.log("[TrackPlayer] Native module not available.");
-    return false;
-  }
-
   try {
     const { default: TrackPlayer, Event, Capability, RepeatMode } = await import("react-native-track-player");
 
     if (!isInitialized) {
       console.log("[TrackPlayer] Setting up player...");
-      await TrackPlayer.setupPlayer();
+      await TrackPlayer.setupPlayer({
+        autoHandleInterruptions: true,
+      });
       await TrackPlayer.updateOptions({
-        // Include Next/Previous so headsets that send those events are captured
         capabilities: [
           Capability.Play,
           Capability.Pause,
@@ -98,6 +87,7 @@ export async function setupTrackPlayer(
       await FileSystem.writeAsStringAsync(silencePath, silenceBase64, {
         encoding: FileSystem.EncodingType.Base64,
       });
+      console.log("[TrackPlayer] Silent WAV written to:", silencePath);
 
       await TrackPlayer.add({
         id: "silence",
@@ -108,6 +98,9 @@ export async function setupTrackPlayer(
       });
       await TrackPlayer.setRepeatMode(RepeatMode.Track);
       await TrackPlayer.play();
+
+      const playbackState = await TrackPlayer.getPlaybackState();
+      console.log("[TrackPlayer] Playback state after play:", playbackState.state);
 
       isInitialized = true;
       console.log("[TrackPlayer] Initialized, media session active");
@@ -142,7 +135,7 @@ export async function setupTrackPlayer(
 }
 
 export async function pauseSilentTrack(): Promise<void> {
-  if (!hasNativeModule() || !isInitialized) return;
+  if (!isInitialized) return;
   try {
     const { default: TrackPlayer } = await import("react-native-track-player");
     await TrackPlayer.pause();
@@ -150,7 +143,7 @@ export async function pauseSilentTrack(): Promise<void> {
 }
 
 export async function resumeSilentTrack(): Promise<void> {
-  if (!hasNativeModule() || !isInitialized) return;
+  if (!isInitialized) return;
   try {
     const { default: TrackPlayer } = await import("react-native-track-player");
     await TrackPlayer.seekTo(0);
@@ -159,7 +152,6 @@ export async function resumeSilentTrack(): Promise<void> {
 }
 
 export async function destroyTrackPlayer(): Promise<void> {
-  if (!hasNativeModule()) return;
   try {
     if (unsubPlay) { unsubPlay(); unsubPlay = null; }
     if (unsubPause) { unsubPause(); unsubPause = null; }
