@@ -38,6 +38,30 @@ export function VoiceOrb({ status, size = 160 }: VoiceOrbProps) {
       );
       animsRef.current.push(anim);
       anim.start();
+    } else if (status === "waiting") {
+      // Soft, slow pulse — mic is open passively waiting for follow-up
+      opacity.setValue(1);
+      ring2Opacity.setValue(0);
+      const scaleAnim = Animated.loop(
+        Animated.sequence([
+          Animated.timing(scale, { toValue: 1.05, duration: 1200, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+          Animated.timing(scale, { toValue: 0.97, duration: 1200, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+        ])
+      );
+      const r1s = Animated.loop(
+        Animated.sequence([
+          Animated.timing(ring1Scale, { toValue: 1.7, duration: 1400, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+          Animated.timing(ring1Scale, { toValue: 1, duration: 0, useNativeDriver: true }),
+        ])
+      );
+      const r1o = Animated.loop(
+        Animated.sequence([
+          Animated.timing(ring1Opacity, { toValue: 0.25, duration: 400, useNativeDriver: true }),
+          Animated.timing(ring1Opacity, { toValue: 0, duration: 1000, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+        ])
+      );
+      animsRef.current.push(scaleAnim, r1s, r1o);
+      [scaleAnim, r1s, r1o].forEach((a) => a.start());
     } else if (status === "recording") {
       opacity.setValue(1);
       const scaleAnim = Animated.loop(
@@ -136,6 +160,7 @@ export function VoiceOrb({ status, size = 160 }: VoiceOrbProps) {
 
   const getOrbColor = () => {
     switch (status) {
+      case "waiting": return "#4f6ef7";
       case "recording": return "#ef4444";
       case "processing": return "#f59e0b";
       case "speaking": return "#10b981";

@@ -19,6 +19,7 @@ import { useColors } from "@/hooks/useColors";
 
 const STATUS_LABELS: Record<AssistantStatus, string> = {
   idle: "Iniciando...",
+  waiting: "¿Algo más?",
   recording: "Escuchando...",
   processing: "Pensando...",
   speaking: "Respondiendo...",
@@ -61,6 +62,8 @@ export default function MainScreen() {
     ? " "
     : status === "speaking"
     ? "Habla o toca para interrumpir"
+    : status === "waiting"
+    ? "Habla para continuar o toca para terminar"
     : "Toca para terminar";
 
   return (

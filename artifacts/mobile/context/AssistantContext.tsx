@@ -10,7 +10,7 @@ import { initDb, getMessages, addMessage, clearMessages, startAutoPurge, stopAut
 import { RollingBufferManager } from "@/services/rollingBufferManager";
 import { onBluetoothDisconnect } from "@/services/bluetoothAudio";
 
-export type AssistantStatus = "idle" | "recording" | "processing" | "speaking";
+export type AssistantStatus = "idle" | "waiting" | "recording" | "processing" | "speaking";
 
 interface VoiceApiResponse {
   audio: string;
@@ -62,6 +62,9 @@ const VAD_SILENCE_THRESHOLD_DB = -45;
 const VAD_SILENCE_DURATION_MS = 1500;
 const VAD_MIN_SPEECH_MS = 300;
 const MAX_RECORDING_MS = 60_000;
+// After AI responds, mic stays open this long waiting for a follow-up question.
+// If no speech detected → session ends automatically (passive background mode).
+const FOLLOW_UP_WINDOW_MS = 7000;
 
 function generateId(): string {
   return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
@@ -99,6 +102,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const isSessionActiveRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const maxRecordingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const followUpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settingsRef = useRef<AssistantSettings>(DEFAULT_SETTINGS);
 
   // Sync setter: updates the ref immediately (same tick) so guards that read
@@ -214,7 +218,16 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const startListeningFn = async () => {
+  const clearFollowUpTimer = () => {
+    if (followUpTimerRef.current) {
+      clearTimeout(followUpTimerRef.current);
+      followUpTimerRef.current = null;
+    }
+  };
+
+  // isFollowUp=true → "Gemini Live" mode: mic opens after AI response for FOLLOW_UP_WINDOW_MS.
+  // If voice is detected → continues conversation. If silence → session ends automatically.
+  const startListeningFn = async (isFollowUp = false) => {
     if (!isSessionActiveRef.current) return;
     if (statusRef.current !== "idle") return;
 
@@ -230,6 +243,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
+      clearFollowUpTimer();
       await RollingBufferManager.pause();
       await pauseSilentTrack();
       // Brief delay so RNTP fully releases audio focus before recording starts
@@ -253,12 +267,26 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       );
 
       recordingRef.current = recording;
-      setStatusSync("recording");
+      // Follow-up mode: show "waiting" until the user starts speaking.
+      // Normal mode: show "recording" immediately.
+      setStatusSync(isFollowUp ? "waiting" : "recording");
 
       let hasSpeech = false;
       let silenceStart: number | null = null;
       let speechStartTime: number | null = null;
       let vadTriggered = false;
+
+      // Follow-up window timer: if no speech in FOLLOW_UP_WINDOW_MS → end session automatically
+      if (isFollowUp) {
+        followUpTimerRef.current = setTimeout(() => {
+          if (!hasSpeech && !vadTriggered && isSessionActiveRef.current) {
+            console.log("[VoiceAssistant] Follow-up window expired with no speech → ending session");
+            recording.setOnRecordingStatusUpdate(null);
+            clearMaxTimer();
+            void stopSessionFn();
+          }
+        }, FOLLOW_UP_WINDOW_MS);
+      }
 
       recording.setOnRecordingStatusUpdate((s) => {
         if (!isSessionActiveRef.current || vadTriggered) return;
@@ -271,6 +299,11 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
           if (!hasSpeech) {
             hasSpeech = true;
             speechStartTime = now;
+            // User started speaking — cancel follow-up timeout and switch to active recording
+            clearFollowUpTimer();
+            if (statusRef.current === "waiting") {
+              setStatusSync("recording");
+            }
           }
           silenceStart = null;
         } else if (hasSpeech) {
@@ -283,14 +316,17 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
             vadTriggered = true;
             recording.setOnRecordingStatusUpdate(null);
             clearMaxTimer();
+            clearFollowUpTimer();
             void sendCurrentRecordingFn();
           }
         }
       });
 
       maxRecordingTimerRef.current = setTimeout(() => {
-        if (!vadTriggered && isSessionActiveRef.current && statusRef.current === "recording") {
+        if (!vadTriggered && isSessionActiveRef.current &&
+          (statusRef.current === "recording" || statusRef.current === "waiting")) {
           vadTriggered = true;
+          clearFollowUpTimer();
           void sendCurrentRecordingFn();
         }
       }, MAX_RECORDING_MS);
@@ -309,7 +345,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
   const sendCurrentRecordingFn = async () => {
     clearMaxTimer();
-    if (statusRef.current !== "recording" || !recordingRef.current) return;
+    if ((statusRef.current !== "recording" && statusRef.current !== "waiting") || !recordingRef.current) return;
     setStatusSync("processing");
 
     try {
@@ -397,7 +433,9 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
       if (isSessionActiveRef.current) {
         setStatusSync("idle");
-        void startListeningFn();
+        // Gemini Live-style: mic reopens automatically after AI responds.
+        // If no speech in FOLLOW_UP_WINDOW_MS → session ends, returns to background.
+        void startListeningFn(true);
       } else {
         setStatusSync("idle");
         await RollingBufferManager.resume();
@@ -432,6 +470,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     setIsSessionActive(false);
 
     clearMaxTimer();
+    clearFollowUpTimer();
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
