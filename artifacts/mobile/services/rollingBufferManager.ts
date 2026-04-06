@@ -79,25 +79,6 @@ class RollingBufferManagerImpl {
     await this._stopAndSaveCurrentRecording();
   }
 
-  /**
-   * Emergency cleanup: forcibly stops and nulls currentRecording without
-   * touching running/paused state. Called by voiceLoopService before EVERY
-   * Audio.Recording.createAsync() to prevent "Only one Recording object can
-   * be prepared at a given time" when a segment timer fired between pause()
-   * returning and createAsync() being called (race condition).
-   */
-  async forceStopRecording(): Promise<void> {
-    if (this.currentRecording !== null) {
-      console.warn("[RollingBuffer] forceStopRecording — stopping orphaned segment recording");
-      const r = this.currentRecording;
-      this.currentRecording = null;
-      try {
-        r.setOnRecordingStatusUpdate(null);
-        await r.stopAndUnloadAsync();
-      } catch {}
-    }
-  }
-
   async resume(): Promise<void> {
     if (!this.running || !this.paused) return;
     this.paused = false;

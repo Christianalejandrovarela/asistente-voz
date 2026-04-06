@@ -1,17 +1,25 @@
 /**
- * voiceLoopService.ts
+ * voiceLoopService.ts  — Diagnostic build
  *
- * The ENTIRE voice-session loop (Record → API → TTS → repeat) lives here as
- * MODULE-LEVEL state.  Module-level variables persist for the lifetime of the
- * React Native JS runtime, regardless of React component mounts/unmounts.
- * This means the loop keeps running even when the UI is suspended (screen off).
+ * ARCHITECTURE
+ * ────────────
+ * All voice-loop state lives at MODULE level (not in React refs) so the loop
+ * persists through React component unmounts and runs headlessly when the
+ * screen is off.  PlaybackService calls toggleVoiceLoop() directly — same JS
+ * runtime, same module state.
  *
- * React components (AssistantContext) subscribe to DeviceEventEmitter events
- * emitted here and mirror the state to React state for display purposes only.
- * The authoritative state is always this module.
+ * DIAGNOSTIC LOGGING
+ * ──────────────────
+ * Every critical hardware event is logged via rlog/rwarn/rerror to the
+ * Replit API server in real-time over HTTP (fire-and-forget).  This gives
+ * visibility into what happens on the physical device when the screen is off.
+ * Watch: artifacts/api-server workflow console for  📱 [APP ANDROID] lines.
  *
- * PlaybackService (headless) can call toggleVoiceLoop() directly — no
- * DeviceEventEmitter round-trip needed, same JS runtime, same module state.
+ * INTENTIONAL SIMPLICITY
+ * ──────────────────────
+ * Patches (mutex, rolling-buffer force-stop, complex cleanup cascades) have
+ * been removed.  The goal of this build is DIAGNOSIS, not fixing.  The logs
+ * will tell us the exact failure point so we can apply a targeted fix.
  */
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -45,79 +53,61 @@ export interface VoiceMessage {
   timestamp: number;
 }
 
-// ─── DeviceEventEmitter event keys ───────────────────────────────────────────
-// AssistantContext subscribes to these to update React state for UI display.
+// ─── DeviceEventEmitter keys (subscribed by AssistantContext) ─────────────────
 
-export const VL_STATUS  = "VL_STATUS";   // payload: { status: VoiceLoopStatus }
-export const VL_SESSION = "VL_SESSION";  // payload: { active: boolean }
-export const VL_MESSAGES = "VL_MESSAGES"; // payload: { messages: VoiceMessage[] }
-export const VL_DEBUG   = "VL_DEBUG";    // payload: { info: string }
-export const VL_ERROR   = "VL_ERROR";    // payload: { title: string; body: string }
+export const VL_STATUS   = "VL_STATUS";
+export const VL_SESSION  = "VL_SESSION";
+export const VL_MESSAGES = "VL_MESSAGES";
+export const VL_DEBUG    = "VL_DEBUG";
+export const VL_ERROR    = "VL_ERROR";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const VAD_SILENCE_THRESHOLD_DB = -45;
-const VAD_SILENCE_DURATION_MS  = 1500;
-const VAD_MIN_SPEECH_MS        = 300;
-const MAX_RECORDING_MS         = 60_000;
-const FOLLOW_UP_WINDOW_MS      = 7_000;
-const MAX_MIC_RETRIES          = 3;
-
+const VAD_SILENCE_DB      = -45;
+const VAD_SILENCE_MS      = 1500;
+const VAD_MIN_SPEECH_MS   = 300;
+const MAX_RECORDING_MS    = 60_000;
+const FOLLOW_UP_MS        = 7_000;
+const MAX_MIC_RETRIES     = 3;
 const SETTINGS_KEY        = "@voice_assistant_settings";
 const CONTEXT_SUMMARY_KEY = "@context_summary";
 
 // ─── Module-level state ───────────────────────────────────────────────────────
+// These variables persist for the lifetime of the JS runtime.
 
-let _isActive       = false;
+let _isActive    = false;
 let _status: VoiceLoopStatus = "idle";
-let _recording:    Audio.Recording | null = null;
-let _sound:        Audio.Sound | null = null;
-let _abortCtrl:    AbortController | null = null;
-let _maxTimer:     ReturnType<typeof setTimeout> | null = null;
+let _recording:  Audio.Recording | null = null;
+let _sound:      Audio.Sound | null = null;
+let _abortCtrl:  AbortController | null = null;
+let _maxTimer:   ReturnType<typeof setTimeout> | null = null;
 let _followUpTimer: ReturnType<typeof setTimeout> | null = null;
 let _micRetryCount = 0;
 let _playbackResolve: (() => void) | null = null;
 let _contextSummary = "";
 
-/**
- * MUTEX — Hardware microphone lock.
- *
- * Set to true synchronously (no await in between check and set) at the very
- * beginning of startListening() BEFORE any async operation that touches the
- * recording hardware.  Cleared only when:
- *   1. startListening() catches an error (mic failed to open)
- *   2. sendCurrentRecording() finishes stopAndUnloadAsync() (hardware freed)
- *   3. stopVoiceLoop() is called (emergency reset)
- *
- * Prevents the "Only one Recording object can be prepared at a given time"
- * error that arises when the Bluetooth button fires multiple events in rapid
- * succession or a retry races with an in-progress setup.
- */
-let _isMicrophoneBusy = false;
-
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 function generateId(): string {
-  return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+  return `${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 }
 
-function setStatusSync(s: VoiceLoopStatus): void {
+function setStatus(s: VoiceLoopStatus): void {
   _status = s;
   DeviceEventEmitter.emit(VL_STATUS, { status: s });
 }
 
 function clearMaxTimer(): void {
-  if (_maxTimer !== null) { clearTimeout(_maxTimer); _maxTimer = null; }
+  if (_maxTimer) { clearTimeout(_maxTimer); _maxTimer = null; }
 }
 function clearFollowUpTimer(): void {
-  if (_followUpTimer !== null) { clearTimeout(_followUpTimer); _followUpTimer = null; }
+  if (_followUpTimer) { clearTimeout(_followUpTimer); _followUpTimer = null; }
 }
 
 function emitDebug(info: string): void {
   console.log("[VoiceLoop]", info);
   DeviceEventEmitter.emit(VL_DEBUG, { info });
 }
-
 function emitError(title: string, body: string): void {
   console.error("[VoiceLoop] ERROR:", title, body);
   DeviceEventEmitter.emit(VL_ERROR, { title, body });
@@ -132,44 +122,41 @@ async function getSettings(): Promise<{ voice: string; language: string }> {
 }
 
 /**
- * Robust Recording Cleanup.
- *
- * Stops and unloads the main recording AND any recording the RollingBuffer
- * Manager may have started after pause() returned (race condition where a
- * segment timer fires in the pause gap).  Called before EVERY createAsync().
+ * Stop and unload the current recording object if one exists.
+ * Simple, single-purpose — no cascade, no rolling-buffer involvement.
  */
-async function forceCleanupAllRecordings(): Promise<void> {
-  if (_recording !== null) {
-    emitDebug("Force-cleaning orphaned main recording");
-    const r = _recording;
-    _recording = null;
-    try { r.setOnRecordingStatusUpdate(null); await r.stopAndUnloadAsync(); } catch {}
+async function stopCurrentRecording(): Promise<void> {
+  if (_recording === null) {
+    rlog("MIC", "stopCurrentRecording() — _recording already null, nothing to stop");
+    return;
   }
-  // Also stop any recording the RollingBufferManager may have started between
-  // the pause() call returning and createAsync() being invoked.
-  try { await RollingBufferManager.forceStopRecording(); } catch {}
+  rlog("MIC", "stopCurrentRecording() — calling stopAndUnloadAsync()...");
+  const r = _recording;
+  _recording = null;
+  try {
+    r.setOnRecordingStatusUpdate(null);
+    await r.stopAndUnloadAsync();
+    rlog("MIC", "stopCurrentRecording() ✓");
+  } catch (e) {
+    rwarn("MIC", `stopCurrentRecording() threw (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 async function readUriAsBase64(uri: string): Promise<string> {
   return FileSystem.readAsStringAsync(uri, { encoding: "base64" });
 }
 
-// ─── Audio playback (strict sequential — no barge-in) ─────────────────────────
-//
-// expo-av is unstable when an Audio.Recording object is active while an
-// Audio.Sound is playing on the same hardware.  The barge-in feature has
-// been removed.  The flow is now strictly:
-//   Record → stop/unload → API → TTS play → stop/unload → Record …
+// ─── Audio playback (sequential — no concurrent recording) ────────────────────
 
 async function playResponseAudio(base64Audio: string): Promise<void> {
-  // Clean up any leftover sound from a previous turn
   if (_sound !== null) {
+    rlog("TTS", "playResponseAudio() — cleaning up previous sound");
     try { await _sound.stopAsync();   } catch {}
     try { await _sound.unloadAsync(); } catch {}
     _sound = null;
   }
 
-  // Configure audio mode for playback
+  rlog("TTS", "playResponseAudio() — setAudioModeAsync for playback");
   await Audio.setAudioModeAsync({
     allowsRecordingIOS: true,
     playsInSilentModeIOS: true,
@@ -183,9 +170,10 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
   const tmpPath = `${FileSystem.cacheDirectory ?? ""}ai_resp_${Date.now()}.mp3`;
   try {
     await FileSystem.writeAsStringAsync(tmpPath, base64Audio, { encoding: "base64" });
+    rlog("TTS", "playResponseAudio() — Audio.Sound.createAsync start");
 
     let resolvePlayback!: () => void;
-    const playbackDone = new Promise<void>((res) => {
+    const done = new Promise<void>((res) => {
       resolvePlayback = res;
       _playbackResolve = res;
     });
@@ -207,15 +195,16 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
       }
     );
     _sound = sound;
+    rlog("TTS", "playResponseAudio() — sound playing, waiting for finish...");
 
-    // Safety-net: unblock after 3 min if status callback never fires
-    const safetyTimeout = new Promise<void>((res) => setTimeout(res, 3 * 60 * 1000));
-    await Promise.race([playbackDone, safetyTimeout]);
+    const safety = new Promise<void>((res) => setTimeout(res, 3 * 60_000));
+    await Promise.race([done, safety]);
 
     _playbackResolve = null;
     try { await sound.stopAsync();   } catch {}
     try { await sound.unloadAsync(); } catch {}
     _sound = null;
+    rlog("TTS", "playResponseAudio() ✓ done");
   } finally {
     try { await FileSystem.deleteAsync(tmpPath, { idempotent: true }); } catch {}
   }
@@ -224,43 +213,36 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
 // ─── Recording loop ───────────────────────────────────────────────────────────
 
 async function startListening(isFollowUp = false): Promise<void> {
-  if (!_isActive) return;
-  if (_status !== "idle") return;
+  rlog("MIC", `startListening(followUp=${isFollowUp}) — _isActive=${_isActive} _status=${_status}`);
 
-  // MUTEX: Prevent concurrent microphone-setup attempts.
-  // In JS there are no thread pre-emptions, so this check+set is atomic.
-  if (_isMicrophoneBusy) {
-    rwarn("MUTEX", `BLOCKED — _isMicrophoneBusy=true, rejecting concurrent startListening (status=${_status})`);
-    emitDebug("Mic busy — ignoring concurrent startListening call");
-    return;
-  }
-  _isMicrophoneBusy = true;  // Lock the hardware mic
-  rlog("MUTEX", `ACQUIRED — _isMicrophoneBusy=true (isFollowUp=${isFollowUp})`);
+  if (!_isActive) { rlog("MIC", "startListening() early-exit: _isActive=false"); return; }
+  if (_status !== "idle") { rlog("MIC", `startListening() early-exit: status=${_status} (expected idle)`); return; }
 
   try {
-    const { status: permStatus } = await Audio.requestPermissionsAsync();
-    rlog("MIC", `requestPermissionsAsync → ${permStatus}`);
-    if (permStatus !== "granted") {
-      rerror("MIC", "Permission NOT granted — stopping session");
-      emitError(
-        "Permiso de micrófono",
-        "Para usar el asistente necesitas conceder acceso al micrófono en los ajustes."
-      );
-      _isMicrophoneBusy = false;
+    rlog("MIC", "requestPermissionsAsync() — asking for mic permission...");
+    const { status: perm } = await Audio.requestPermissionsAsync();
+    rlog("MIC", `requestPermissionsAsync() → ${perm}`);
+
+    if (perm !== "granted") {
+      rerror("MIC", "PERMISSION DENIED — cannot record");
+      emitError("Permiso de micrófono", "Activa el micrófono en los ajustes.");
       await stopVoiceLoop();
       return;
     }
 
     clearFollowUpTimer();
+
+    rlog("MIC", "RollingBufferManager.pause() + pauseSilentTrack()");
     await RollingBufferManager.pause();
     await pauseSilentTrack();
 
-    // Guarantee all recording objects are released before createAsync.
-    rlog("MIC", "forceCleanupAllRecordings() start");
-    await forceCleanupAllRecordings();
-    rlog("MIC", "forceCleanupAllRecordings() done — about to createAsync()");
+    // Stop previous recording if somehow still active (diagnostic: log if it happens)
+    if (_recording !== null) {
+      rwarn("MIC", "UNEXPECTED: _recording is not null at startListening start — stopping it");
+    }
+    await stopCurrentRecording();
 
-    // Claim exclusive audio focus for recording.
+    rlog("MIC", "setAudioModeAsync for recording...");
     await Audio.setAudioModeAsync({
       allowsRecordingIOS: true,
       playsInSilentModeIOS: true,
@@ -270,70 +252,68 @@ async function startListening(isFollowUp = false): Promise<void> {
         playThroughEarpieceAndroid: false,
       } : {}),
     });
+    rlog("MIC", "setAudioModeAsync ✓");
 
-    rlog("MIC", "Audio.Recording.createAsync() → opening hardware mic...");
+    rlog("MIC", "Audio.Recording.createAsync() — opening hardware mic...");
     const { recording } = await Audio.Recording.createAsync(
       { ...Audio.RecordingOptionsPresets.HIGH_QUALITY, isMeteringEnabled: true },
       undefined,
       100
     );
-    rlog("MIC", "Audio.Recording.createAsync() ✓ — hardware mic is open");
+    rlog("MIC", "Audio.Recording.createAsync() ✓ — hardware mic is OPEN");
 
-    // Recording is live — mutex stays locked until sendCurrentRecording releases it.
     _recording = recording;
     _micRetryCount = 0;
-    setStatusSync(isFollowUp ? "waiting" : "recording");
+    setStatus(isFollowUp ? "waiting" : "recording");
 
-    let hasSpeech        = false;
+    let hasSpeech       = false;
     let silenceStart: number | null = null;
-    let speechStartTime: number | null = null;
-    let vadTriggered     = false;
+    let speechStart: number | null = null;
+    let vadTriggered    = false;
 
     if (isFollowUp) {
       _followUpTimer = setTimeout(() => {
         if (!hasSpeech && !vadTriggered && _isActive) {
-          emitDebug("Follow-up window expired — ending session");
+          rlog("VAD", "follow-up window expired — no speech detected, stopping session");
           recording.setOnRecordingStatusUpdate(null);
           clearMaxTimer();
           void stopVoiceLoop();
         }
-      }, FOLLOW_UP_WINDOW_MS);
+      }, FOLLOW_UP_MS);
     }
 
     recording.setOnRecordingStatusUpdate((s) => {
       if (!_isActive || vadTriggered) return;
       if (!s.isRecording) return;
 
-      const metering = s.metering ?? -160;
+      const db  = s.metering ?? -160;
       const now = Date.now();
 
-      if (metering > VAD_SILENCE_THRESHOLD_DB) {
+      if (db > VAD_SILENCE_DB) {
         if (!hasSpeech) {
-          hasSpeech = true;
-          speechStartTime = now;
+          hasSpeech  = true;
+          speechStart = now;
           clearFollowUpTimer();
-          if (_status === "waiting") setStatusSync("recording");
+          if (_status === "waiting") setStatus("recording");
         }
         silenceStart = null;
       } else if (hasSpeech) {
         if (!silenceStart) silenceStart = now;
-        const speechDuration = speechStartTime ? now - speechStartTime : 0;
-        if (
-          now - silenceStart >= VAD_SILENCE_DURATION_MS &&
-          speechDuration >= VAD_MIN_SPEECH_MS
-        ) {
+        const dur = speechStart ? now - speechStart : 0;
+        if (now - silenceStart >= VAD_SILENCE_MS && dur >= VAD_MIN_SPEECH_MS) {
           vadTriggered = true;
           recording.setOnRecordingStatusUpdate(null);
           clearMaxTimer();
           clearFollowUpTimer();
+          rlog("VAD", `VAD triggered — speechDuration=${dur}ms silence=${now - silenceStart}ms`);
           void sendCurrentRecording();
         }
       }
     });
 
     _maxTimer = setTimeout(() => {
-      if (!vadTriggered && _isActive &&
-        (_status === "recording" || _status === "waiting")) {
+      if (!vadTriggered && _isActive && (_status === "recording" || _status === "waiting")) {
+        rlog("VAD", "MAX recording time reached — sending anyway");
         vadTriggered = true;
         clearFollowUpTimer();
         void sendCurrentRecording();
@@ -341,26 +321,22 @@ async function startListening(isFollowUp = false): Promise<void> {
     }, MAX_RECORDING_MS);
 
   } catch (err) {
-    // Release mutex so retries can proceed
-    _isMicrophoneBusy = false;
     const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-    rerror("MIC", `createAsync FAILED (retry ${_micRetryCount + 1}/${MAX_MIC_RETRIES}): ${msg}`);
-    rlog("MUTEX", `RELEASED — error path (retry ${_micRetryCount + 1})`);
     _micRetryCount += 1;
+    rerror("MIC", `startListening CATCH — attempt ${_micRetryCount}/${MAX_MIC_RETRIES}: ${msg}`);
     emitDebug(`Error mic (${_micRetryCount}/${MAX_MIC_RETRIES}): ${msg}`);
-    setStatusSync("idle");
+    setStatus("idle");
     await RollingBufferManager.resume();
     await resumeSilentTrack();
 
     if (_isActive) {
       if (_micRetryCount < MAX_MIC_RETRIES) {
-        setTimeout(() => { void startListening(); }, 1000 * _micRetryCount);
+        const delay = 1000 * _micRetryCount;
+        rlog("MIC", `scheduling retry in ${delay}ms`);
+        setTimeout(() => { void startListening(); }, delay);
       } else {
-        console.error("[VoiceLoop] Max mic retries reached — stopping session");
-        emitError(
-          "Error de micrófono",
-          `No se pudo iniciar el micrófono después de ${MAX_MIC_RETRIES} intentos.\n\n${msg}`
-        );
+        rerror("MIC", `MAX RETRIES REACHED — giving up, stopping session`);
+        emitError("Error de micrófono", `No se pudo iniciar el micrófono (${MAX_MIC_RETRIES} intentos).\n\n${msg}`);
         void stopVoiceLoop();
       }
     }
@@ -368,35 +344,38 @@ async function startListening(isFollowUp = false): Promise<void> {
 }
 
 async function sendCurrentRecording(): Promise<void> {
+  rlog("MIC", `sendCurrentRecording() — status=${_status} _recording=${_recording !== null}`);
   clearMaxTimer();
-  if ((_status !== "recording" && _status !== "waiting") || _recording === null) return;
-  setStatusSync("processing");
+  if ((_status !== "recording" && _status !== "waiting") || _recording === null) {
+    rwarn("MIC", "sendCurrentRecording() early-exit: wrong status or null recording");
+    return;
+  }
+  setStatus("processing");
 
+  // Snapshot and null out before await so no other path can grab this reference
   const recording = _recording;
   _recording = null;
 
-  rlog("MIC", "stopAndUnloadAsync() — releasing hardware mic...");
+  rlog("MIC", "sendCurrentRecording() — stopAndUnloadAsync()...");
   try {
     await recording.stopAndUnloadAsync();
-    rlog("MIC", "stopAndUnloadAsync() ✓ — hardware mic released");
+    rlog("MIC", "sendCurrentRecording() — stopAndUnloadAsync() ✓ hardware mic released");
   } catch (e) {
-    rwarn("MIC", `stopAndUnloadAsync() threw (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+    rwarn("MIC", `sendCurrentRecording() — stopAndUnloadAsync() threw: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  // Hardware mic is now free — release the mutex before any await operations
-  // so the next startListening() call can proceed after TTS playback finishes.
-  _isMicrophoneBusy = false;
-  rlog("MUTEX", "RELEASED — mic hardware free, loop continues to API+TTS");
-
   const uri = recording.getURI();
+  rlog("MIC", `sendCurrentRecording() — URI=${uri ?? "null"}`);
 
   try {
-    if (!uri) throw new Error("No recording URI");
+    if (!uri) throw new Error("No recording URI after stopAndUnload");
 
     const base64Audio = await readUriAsBase64(uri);
+    rlog("API", `audio captured — ${(base64Audio.length * 0.75 / 1024).toFixed(0)} KB, sending to API...`);
 
     if (!_isActive) {
-      setStatusSync("idle");
+      rlog("API", "sendCurrentRecording() aborted — _isActive=false before fetch");
+      setStatus("idle");
       await RollingBufferManager.resume();
       await resumeSilentTrack();
       return;
@@ -408,21 +387,17 @@ async function sendCurrentRecording(): Promise<void> {
       : "http://localhost:8080/api/voice/chat";
 
     await purgeOldMessages();
-    const settings = await getSettings();
-    const recentHistory = await getMessages(20);
-    const contextText = RollingBufferManager.getContextText();
+    const settings     = await getSettings();
+    const history      = await getMessages(20);
+    const contextText  = RollingBufferManager.getContextText();
 
-    const historyPayload: { role: string; text: string }[] = [];
-    if (contextText.length > 0) {
-      historyPayload.push({ role: "user", text: `[Contexto ambiental]: ${contextText}` });
-    }
-    for (const m of recentHistory) {
-      if (!m.text.startsWith("[contexto]")) {
-        historyPayload.push({ role: m.role, text: m.text });
-      }
+    const payload: { role: string; text: string }[] = [];
+    if (contextText) payload.push({ role: "user", text: `[Contexto]: ${contextText}` });
+    for (const m of history) {
+      if (!m.text.startsWith("[contexto]")) payload.push({ role: m.role, text: m.text });
     }
 
-    rlog("API", `fetch → ${apiUrl}`);
+    rlog("API", `fetch POST ${apiUrl}`);
     _abortCtrl = new AbortController();
     const response = await fetch(apiUrl, {
       method: "POST",
@@ -431,7 +406,7 @@ async function sendCurrentRecording(): Promise<void> {
         audio: base64Audio,
         voice: settings.voice,
         language: settings.language,
-        history: historyPayload.slice(-30),
+        history: payload.slice(-30),
         contextSummary: _contextSummary || undefined,
       }),
       signal: _abortCtrl.signal,
@@ -439,60 +414,59 @@ async function sendCurrentRecording(): Promise<void> {
     _abortCtrl = null;
 
     if (!_isActive) {
-      setStatusSync("idle");
+      rlog("API", "response received but _isActive=false — discarding");
+      setStatus("idle");
       await RollingBufferManager.resume();
       await resumeSilentTrack();
       return;
     }
 
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`API ${response.status}: ${errText}`);
+      const txt = await response.text();
+      throw new Error(`API ${response.status}: ${txt}`);
     }
 
-    interface ApiResponse {
+    interface ApiResp {
       audio: string;
       userText: string;
       assistantText: string;
       newContextSummary?: string;
     }
-    const data = await response.json() as ApiResponse;
-    const now = Date.now();
+    const data = await response.json() as ApiResp;
+    rlog("API", `response OK — user="${data.userText.slice(0,50)}" asst="${data.assistantText.slice(0,50)}"`);
 
+    const now = Date.now();
     if (data.newContextSummary) {
-      emitDebug("Context compressed — resetting local history");
       _contextSummary = data.newContextSummary;
       await clearMessages();
       void AsyncStorage.setItem(CONTEXT_SUMMARY_KEY, data.newContextSummary);
       DeviceEventEmitter.emit(VL_MESSAGES, { messages: [] });
     }
 
-    const userMsg:  VoiceMessage = { id: generateId(), role: "user",      text: data.userText,      timestamp: now };
-    const assistMsg: VoiceMessage = { id: generateId(), role: "assistant", text: data.assistantText, timestamp: now + 1 };
-    void addMessage(userMsg);
-    void addMessage(assistMsg);
-    DeviceEventEmitter.emit(VL_MESSAGES, { append: [userMsg, assistMsg] });
+    const um: VoiceMessage = { id: generateId(), role: "user",      text: data.userText,      timestamp: now };
+    const am: VoiceMessage = { id: generateId(), role: "assistant", text: data.assistantText, timestamp: now + 1 };
+    void addMessage(um);
+    void addMessage(am);
+    DeviceEventEmitter.emit(VL_MESSAGES, { append: [um, am] });
 
     if (!_isActive) {
-      setStatusSync("idle");
+      setStatus("idle");
       await RollingBufferManager.resume();
       await resumeSilentTrack();
       return;
     }
 
-    rlog("API", `response OK — userText="${data.userText.slice(0,60)}" assistText="${data.assistantText.slice(0,60)}"`);
-    setStatusSync("speaking");
-    rlog("TTS", "playResponseAudio() start");
+    setStatus("speaking");
+    rlog("TTS", "starting playResponseAudio()");
     await playResponseAudio(data.audio);
-    rlog("TTS", "playResponseAudio() done");
+    rlog("TTS", "playResponseAudio() finished");
 
     if (_isActive) {
-      setStatusSync("idle");
-      rlog("LOOP", "TTS done, _isActive=true → startListening(followUp)");
-      // Gemini Live-style: mic reopens automatically after AI responds
+      setStatus("idle");
+      rlog("LOOP", "loop continues → startListening(followUp=true)");
       void startListening(true);
     } else {
-      setStatusSync("idle");
+      setStatus("idle");
       await RollingBufferManager.resume();
       await resumeSilentTrack();
     }
@@ -500,13 +474,17 @@ async function sendCurrentRecording(): Promise<void> {
   } catch (err) {
     const isAbort = err instanceof Error && err.name === "AbortError";
     if (!isAbort) {
-      const message = err instanceof Error ? err.message : "Error desconocido";
-      emitError("Error", `No se pudo procesar: ${message}`);
+      const msg = err instanceof Error ? err.message : "Error desconocido";
+      rerror("API", `sendCurrentRecording CATCH: ${msg}`);
+      emitError("Error", `No se pudo procesar: ${msg}`);
+    } else {
+      rlog("API", "fetch aborted (session stopped)");
     }
-    setStatusSync("idle");
+    setStatus("idle");
     await RollingBufferManager.resume();
     await resumeSilentTrack();
     if (_isActive && !isAbort) {
+      rlog("LOOP", "error recovery — startListening() in 1s");
       setTimeout(() => { void startListening(); }, 1000);
     }
   }
@@ -514,44 +492,33 @@ async function sendCurrentRecording(): Promise<void> {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-/** Start a new voice session (record → API → TTS → loop). */
 export async function startVoiceLoop(): Promise<void> {
-  if (_isActive) return;
-  rlog("LOOP", "startVoiceLoop() — _isActive=false → starting session");
+  rlog("LOOP", `startVoiceLoop() — _isActive=${_isActive}`);
+  if (_isActive) { rlog("LOOP", "startVoiceLoop() ignored — already active"); return; }
   _isActive = true;
   _micRetryCount = 0;
-
-  // Load context summary from storage (may have been set in a previous session)
   try {
     const stored = await AsyncStorage.getItem(CONTEXT_SUMMARY_KEY);
     if (stored) _contextSummary = stored;
   } catch {}
-
   DeviceEventEmitter.emit(VL_SESSION, { active: true });
   emitDebug("Sesión iniciada");
   await startListening();
 }
 
-/** Stop the current voice session and clean up all resources. */
 export async function stopVoiceLoop(): Promise<void> {
-  if (!_isActive) return;
-  rlog("LOOP", `stopVoiceLoop() — status=${_status} micBusy=${_isMicrophoneBusy}`);
+  rlog("LOOP", `stopVoiceLoop() — _isActive=${_isActive} status=${_status}`);
+  if (!_isActive) { rlog("LOOP", "stopVoiceLoop() ignored — already inactive"); return; }
   _isActive = false;
-  _isMicrophoneBusy = false;  // Emergency reset of the hardware lock
   DeviceEventEmitter.emit(VL_SESSION, { active: false });
 
   clearMaxTimer();
   clearFollowUpTimer();
-
   if (_abortCtrl) { _abortCtrl.abort(); _abortCtrl = null; }
-
-  // Interrupt playback if speaking
   if (_playbackResolve) { _playbackResolve(); _playbackResolve = null; }
 
-  // Force-cleanup all recordings
-  await forceCleanupAllRecordings();
+  await stopCurrentRecording();
 
-  // Stop sound
   if (_sound !== null) {
     try { await _sound.stopAsync();   } catch {}
     try { await _sound.unloadAsync(); } catch {}
@@ -560,31 +527,26 @@ export async function stopVoiceLoop(): Promise<void> {
 
   await RollingBufferManager.resume();
   await resumeSilentTrack();
-  setStatusSync("idle");
+  setStatus("idle");
+  rlog("LOOP", "stopVoiceLoop() ✓ session ended");
   emitDebug("Sesión terminada");
 }
 
-/** Toggle between start and stop. Called by PlaybackService and the UI. */
 export function toggleVoiceLoop(): void {
-  if (_isActive) {
-    void stopVoiceLoop();
-  } else {
-    void startVoiceLoop();
-  }
+  rlog("LOOP", `toggleVoiceLoop() — _isActive=${_isActive}`);
+  if (_isActive) { void stopVoiceLoop(); } else { void startVoiceLoop(); }
 }
 
-/** Interrupt TTS playback and immediately start listening again. */
 export function interruptSpeaking(): void {
+  rlog("LOOP", `interruptSpeaking() — status=${_status}`);
   if (_status !== "speaking") return;
   if (_playbackResolve) { _playbackResolve(); _playbackResolve = null; }
 }
 
-/** Read-only snapshot of current state (for AssistantContext sync on mount). */
 export function getVoiceLoopSnapshot(): { status: VoiceLoopStatus; isActive: boolean } {
   return { status: _status, isActive: _isActive };
 }
 
-/** Called by AssistantContext when the user changes settings (voice/language). */
 export function updateLoopSettings(settings: { voice: string; language: string }): void {
   void AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
 }
