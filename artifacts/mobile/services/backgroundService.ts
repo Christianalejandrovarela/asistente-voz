@@ -53,7 +53,10 @@ export async function startBackgroundService(): Promise<boolean> {
       await new Promise<never>(() => {});
     };
 
-    await BackgroundService.start(backgroundTask, {
+    // The @types package for react-native-background-actions is missing
+    // `wakeLock` in its type definition, but the runtime supports it.
+    // Cast via unknown to avoid the false TS2353 error.
+    const options = {
       taskName: "VoiceAssistant",
       taskTitle: "Asistente de Voz IA",
       taskDesc: "Presiona el botón del auricular para activar",
@@ -70,7 +73,9 @@ export async function startBackgroundService(): Promise<boolean> {
         value: 0,
         indeterminate: true,
       },
-    });
+    } as unknown as Parameters<typeof BackgroundService.start>[1];
+
+    await BackgroundService.start(backgroundTask, options);
 
     rlog("BG", "BackgroundService.start() resolved — foreground service notification up");
     console.log("[BackgroundService] Started successfully");
