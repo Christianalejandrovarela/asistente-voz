@@ -2,8 +2,10 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Platform } from "react-native";
 
 import { RollingBufferManager } from "@/services/rollingBufferManager";
+import { rlog } from "@/services/remoteLogger";
 
 const ROLLING_BUFFER_KEY = "@rolling_buffer_active";
+const HEARTBEAT_MS = 15_000;
 
 export async function startBackgroundService(): Promise<boolean> {
   if (Platform.OS === "web") return false;
@@ -17,32 +19,38 @@ export async function startBackgroundService(): Promise<boolean> {
     }
 
     /**
-     * The background task must not resolve until BackgroundService.stop() is called.
-     * react-native-background-actions terminates the task when the returned promise
-     * resolves, so we use an indefinitely-pending promise that only settles when
-     * we detect the service has been stopped (checked every 10 seconds).
+     * ANDROID DOZE / CPU-SLEEP PROTECTION
+     * ─────────────────────────────────────
+     * Three layers keep the JS thread alive when the screen is off:
      *
-     * This ensures the Android foreground service and iOS background audio session
-     * remain active for the lifetime of the user session (24/7 standby).
+     * 1. wakeLock: true  — react-native-background-actions acquires a
+     *    PARTIAL_WAKE_LOCK so the CPU stays powered even in Doze mode.
+     *
+     * 2. Heartbeat setInterval (15 s) — constant JS activity prevents
+     *    Android from freezing the runtime due to inactivity.  Also
+     *    visible in the remote log server as a heartbeat pulse.
+     *
+     * 3. await new Promise(() => {}) — the task promise NEVER resolves,
+     *    so the OS never assumes the background task has finished.
+     *    Cleanup happens via BackgroundService.stop() in stopBackgroundService().
      */
     const backgroundTask = async () => {
       await _restoreRollingBufferIfEnabled();
 
-      await new Promise<void>((resolve) => {
-        const keepAlive = setInterval(async () => {
-          try {
-            const running = await BackgroundService.isRunning();
-            if (!running) {
-              clearInterval(keepAlive);
-              await RollingBufferManager.stop();
-              resolve();
-            }
-          } catch {
-            clearInterval(keepAlive);
-            resolve();
-          }
-        }, 10_000);
-      });
+      rlog("BG", "background task started — wakeLock active, heartbeat armed");
+
+      // Heartbeat: keeps JS thread warm, visible in remote logs.
+      const heartbeat = setInterval(() => {
+        console.log("[Heartbeat] JS Thread alive");
+        rlog("HEARTBEAT", "JS Thread alive");
+      }, HEARTBEAT_MS);
+
+      // Silence the "unused variable" lint warning — heartbeat intentionally
+      // runs for the lifetime of the process.
+      void heartbeat;
+
+      // Never resolve: tells the OS this task is permanently ongoing.
+      await new Promise<never>(() => {});
     };
 
     await BackgroundService.start(backgroundTask, {
@@ -55,6 +63,8 @@ export async function startBackgroundService(): Promise<boolean> {
       },
       color: "#4f6ef7",
       linkingURI: "mobile:///",
+      // ① WakeLock: keeps CPU awake in Android Doze / deep sleep.
+      wakeLock: true,
       progressBar: {
         max: 100,
         value: 0,
@@ -62,6 +72,7 @@ export async function startBackgroundService(): Promise<boolean> {
       },
     });
 
+    rlog("BG", "BackgroundService.start() resolved — foreground service notification up");
     console.log("[BackgroundService] Started successfully");
     return true;
   } catch (err) {
@@ -73,7 +84,9 @@ export async function startBackgroundService(): Promise<boolean> {
 export async function stopBackgroundService(): Promise<void> {
   try {
     const BackgroundService = (await import("react-native-background-actions")).default;
+    await RollingBufferManager.stop();
     await BackgroundService.stop();
+    rlog("BG", "BackgroundService stopped");
   } catch {}
 }
 
