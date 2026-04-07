@@ -10,3 +10,4 @@ downloads/asistente-voz-build26.apk filter=lfs diff=lfs merge=lfs -text
 downloads/asistente-voz-build27.apk filter=lfs diff=lfs merge=lfs -text
 downloads/asistente-voz-build28.apk filter=lfs diff=lfs merge=lfs -text
 downloads/asistente-voz-build29.apk filter=lfs diff=lfs merge=lfs -text
+downloads/asistente-voz-build30.apk filter=lfs diff=lfs merge=lfs -text
