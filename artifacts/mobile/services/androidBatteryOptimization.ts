@@ -48,7 +48,7 @@ export async function requestBatteryOptimizationExemption(): Promise<void> {
           "3. Busca «Asistente de Voz IA»\n" +
           "4. Selecciona «Sin restricciones»\n\n" +
           "O bien: Ajustes → Aplicaciones → Asistente de Voz IA → Batería → Sin restricciones.",
-          [{ text: "Entendido", onPress: resolve }]
+          [{ text: "Entendido", onPress: () => resolve() }]
         );
       });
     }
