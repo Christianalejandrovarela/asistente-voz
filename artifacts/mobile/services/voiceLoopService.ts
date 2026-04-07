@@ -36,6 +36,11 @@ import {
 import { pauseSilentTrack, resumeSilentTrack } from "@/services/trackPlayer";
 import { RollingBufferManager } from "@/services/rollingBufferManager";
 import { rlog, rwarn, rerror } from "@/services/remoteLogger";
+import {
+  getUserProfile,
+  applyProfileUpdates,
+  type ProfileUpdate,
+} from "@/services/userProfileService";
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -380,12 +385,42 @@ async function startListening(isFollowUp = false): Promise<void> {
     let vadTriggered    = false;
 
     if (isFollowUp) {
-      _followUpTimer = setTimeout(() => {
+      // ── CONTINUOUS LOOP: silence timeout restarts the mic, never kills session ──
+      // If no speech is detected within FOLLOW_UP_MS, we silently stop this
+      // recording and immediately reopen the mic so the user can speak at any
+      // time.  The session stays alive until the button is pressed again.
+      _followUpTimer = setTimeout(async () => {
         if (!hasSpeech && !vadTriggered && _isActive) {
-          rlog("VAD", "follow-up window expired — no speech detected, stopping session");
+          rlog("VAD", "silence timeout — restarting mic (session continues, toggle to stop)");
           recording.setOnRecordingStatusUpdate(null);
           clearMaxTimer();
-          void stopVoiceLoop();
+          vadTriggered = true;
+
+          // Stop and discard this silent recording without sending it to the API.
+          try {
+            await recording.stopAndUnloadAsync();
+          } catch {}
+          if (_recording === recording) _recording = null;
+
+          // Reset audio mode (recording → playback) so RNTP regains focus.
+          try {
+            await Audio.setAudioModeAsync({
+              allowsRecordingIOS: false,
+              playsInSilentModeIOS: true,
+              staysActiveInBackground: true,
+              ...(Platform.OS === "android" ? {
+                shouldDuckAndroid: true,
+                playThroughEarpieceAndroid: false,
+              } : {}),
+            });
+          } catch {}
+
+          await RollingBufferManager.resume();
+          await resumeSilentTrack();
+          setStatus("idle");
+
+          // Brief pause, then re-open mic with a new silence timer.
+          setTimeout(() => { if (_isActive) void startListening(true); }, 400);
         }
       }, FOLLOW_UP_MS);
     }
@@ -497,8 +532,14 @@ async function sendCurrentRecording(): Promise<void> {
       : "http://localhost:8080/api/voice/chat";
 
     await purgeOldMessages();
-    const settings     = await getSettings();
-    const history      = await getMessages(20);
+    const [settings, history, userProfile] = await Promise.all([
+      getSettings(),
+      // Limit to last 8 exchanges (16 messages) — keeps payload small and API fast.
+      // Older context is preserved via contextSummary rolling compression.
+      getMessages(16),
+      // Load the persistent user profile for long-term memory injection.
+      getUserProfile(),
+    ]);
     const contextText  = RollingBufferManager.getContextText();
 
     const payload: { role: string; text: string }[] = [];
@@ -507,7 +548,7 @@ async function sendCurrentRecording(): Promise<void> {
       if (!m.text.startsWith("[contexto]")) payload.push({ role: m.role, text: m.text });
     }
 
-    rlog("API", `fetch POST ${apiUrl}`);
+    rlog("API", `fetch POST ${apiUrl} — history=${payload.length} msgs profile=${userProfile.name ?? "(anon)"}`);
     _abortCtrl = new AbortController();
     const response = await fetch(apiUrl, {
       method: "POST",
@@ -516,8 +557,9 @@ async function sendCurrentRecording(): Promise<void> {
         audio: base64Audio,
         voice: settings.voice,
         language: settings.language,
-        history: payload.slice(-30),
+        history: payload.slice(-16),
         contextSummary: _contextSummary || undefined,
+        userProfile,
       }),
       signal: _abortCtrl.signal,
     });
@@ -541,9 +583,16 @@ async function sendCurrentRecording(): Promise<void> {
       userText: string;
       assistantText: string;
       newContextSummary?: string;
+      profileUpdates?: ProfileUpdate[];
     }
     const data = await response.json() as ApiResp;
     rlog("API", `response OK — user="${data.userText.slice(0,50)}" asst="${data.assistantText.slice(0,50)}"`);
+
+    // Apply long-term memory updates (fire-and-forget — non-blocking for TTS).
+    if (data.profileUpdates?.length) {
+      rlog("PROFILE", `${data.profileUpdates.length} update(s) extracted — applying...`);
+      void applyProfileUpdates(data.profileUpdates);
+    }
 
     const now = Date.now();
     if (data.newContextSummary) {
@@ -573,7 +622,7 @@ async function sendCurrentRecording(): Promise<void> {
 
     if (_isActive) {
       setStatus("idle");
-      rlog("LOOP", "loop continues → startListening(followUp=true)");
+      rlog("LOOP", "loop continues → startListening(followUp=true) [continuous — session stays until toggle]");
       void startListening(true);
     } else {
       setStatus("idle");
@@ -708,8 +757,23 @@ export async function stopVoiceLoop(): Promise<void> {
 }
 
 export function toggleVoiceLoop(): void {
-  rlog("LOOP", `toggleVoiceLoop() — _isActive=${_isActive}`);
-  if (_isActive) { void stopVoiceLoop(); } else { void startVoiceLoop(); }
+  rlog("LOOP", `toggleVoiceLoop() — _isActive=${_isActive} status=${_status}`);
+
+  if (_status === "speaking" && _isActive) {
+    // ── BARGE-IN: AI is talking — interrupt TTS and go back to listening ──────
+    // interruptSpeaking() resolves _playbackResolve(), which makes
+    // playResponseAudio() return early.  The sendCurrentRecording() code that
+    // called await playResponseAudio() then sees _isActive=true and naturally
+    // calls startListening() — so the mic opens without any extra work here.
+    rlog("LOOP", "toggleVoiceLoop() BARGE-IN — stopping TTS, mic will open automatically");
+    interruptSpeaking();
+  } else if (_isActive) {
+    // Session is running but not speaking → toggle OFF
+    void stopVoiceLoop();
+  } else {
+    // Session is idle → toggle ON
+    void startVoiceLoop();
+  }
 }
 
 export function interruptSpeaking(): void {
