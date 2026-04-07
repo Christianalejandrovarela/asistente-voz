@@ -77,6 +77,12 @@ const CONTEXT_SUMMARY_KEY = "@context_summary";
 
 let _isActive    = false;
 let _status: VoiceLoopStatus = "idle";
+// Cache permission result: requestPermissionsAsync() can take 10-16 seconds
+// when the screen is off on Samsung One UI — we avoid the delay by caching
+// the result after first grant and using getPermissionsAsync() on retries.
+let _micPermissionGranted = false;
+// Mutex flag: prevents two concurrent startListening() calls from racing.
+let _startListeningInFlight = false;
 let _recording:  Audio.Recording | null = null;
 let _sound:      Audio.Sound | null = null;
 let _abortCtrl:  AbortController | null = null;
@@ -217,17 +223,35 @@ async function startListening(isFollowUp = false): Promise<void> {
 
   if (!_isActive) { rlog("MIC", "startListening() early-exit: _isActive=false"); return; }
   if (_status !== "idle") { rlog("MIC", `startListening() early-exit: status=${_status} (expected idle)`); return; }
+  if (_startListeningInFlight) { rlog("MIC", "startListening() early-exit: already in-flight (mutex)"); return; }
+  _startListeningInFlight = true;
 
   try {
-    rlog("MIC", "requestPermissionsAsync() — asking for mic permission...");
-    const { status: perm } = await Audio.requestPermissionsAsync();
-    rlog("MIC", `requestPermissionsAsync() → ${perm}`);
-
-    if (perm !== "granted") {
-      rerror("MIC", "PERMISSION DENIED — cannot record");
-      emitError("Permiso de micrófono", "Activa el micrófono en los ajustes.");
-      await stopVoiceLoop();
-      return;
+    if (!_micPermissionGranted) {
+      // First-time check: call requestPermissionsAsync() to trigger the system dialog.
+      rlog("MIC", "requestPermissionsAsync() — asking for mic permission...");
+      const { status: perm } = await Audio.requestPermissionsAsync();
+      rlog("MIC", `requestPermissionsAsync() → ${perm}`);
+      if (perm !== "granted") {
+        rerror("MIC", "PERMISSION DENIED — cannot record");
+        emitError("Permiso de micrófono", "Activa el micrófono en los ajustes.");
+        await stopVoiceLoop();
+        return;
+      }
+      _micPermissionGranted = true;
+    } else {
+      // Fast path: use getPermissionsAsync() (returns instantly, no system dialog delay).
+      // On Samsung with screen off, requestPermissionsAsync() blocks for 10-16 seconds
+      // even when the permission is already granted — this avoids that stall.
+      const { status: perm } = await Audio.getPermissionsAsync();
+      rlog("MIC", `getPermissionsAsync() (cached path) → ${perm}`);
+      if (perm !== "granted") {
+        _micPermissionGranted = false;
+        rerror("MIC", "PERMISSION REVOKED — cannot record");
+        emitError("Permiso de micrófono", "El permiso fue revocado. Activa el micrófono en los ajustes.");
+        await stopVoiceLoop();
+        return;
+      }
     }
 
     clearFollowUpTimer();
@@ -265,6 +289,7 @@ async function startListening(isFollowUp = false): Promise<void> {
     _recording = recording;
     _micRetryCount = 0;
     setStatus(isFollowUp ? "waiting" : "recording");
+    _startListeningInFlight = false; // mutex released — recording is live
 
     let hasSpeech       = false;
     let silenceStart: number | null = null;
@@ -321,6 +346,7 @@ async function startListening(isFollowUp = false): Promise<void> {
     }, MAX_RECORDING_MS);
 
   } catch (err) {
+    _startListeningInFlight = false; // mutex released on error path
     const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
     _micRetryCount += 1;
     rerror("MIC", `startListening CATCH — attempt ${_micRetryCount}/${MAX_MIC_RETRIES}: ${msg}`);
@@ -510,6 +536,7 @@ export async function stopVoiceLoop(): Promise<void> {
   rlog("LOOP", `stopVoiceLoop() — _isActive=${_isActive} status=${_status}`);
   if (!_isActive) { rlog("LOOP", "stopVoiceLoop() ignored — already inactive"); return; }
   _isActive = false;
+  _startListeningInFlight = false; // cancel any in-flight mic open
   DeviceEventEmitter.emit(VL_SESSION, { active: false });
 
   clearMaxTimer();
