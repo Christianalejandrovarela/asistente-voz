@@ -31,6 +31,38 @@ function parseAudio(audio: unknown): Buffer | null {
 }
 
 /**
+ * GET /api/voice/greeting?voice=nova
+ * Returns a short TTS greeting so the assistant speaks first when activated
+ * with the screen off (Bluetooth button press). Cached server-side per voice.
+ */
+const greetingCache = new Map<string, string>(); // voice → base64-mp3
+
+router.get("/voice/greeting", async (req: Request, res: Response) => {
+  const voice = VALID_VOICES.includes(req.query.voice as VoiceParam)
+    ? (req.query.voice as VoiceParam)
+    : "nova";
+
+  if (greetingCache.has(voice)) {
+    res.json({ audio: greetingCache.get(voice) });
+    return;
+  }
+
+  try {
+    const { textToSpeech } = await import(
+      "@workspace/integrations-openai-ai-server/audio"
+    );
+    const buffer = await textToSpeech("Dime, te escucho.", voice, "mp3");
+    const base64 = buffer.toString("base64");
+    greetingCache.set(voice, base64);
+    res.json({ audio: base64 });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "TTS failed";
+    req.log?.error({ err }, "Greeting TTS error");
+    res.status(500).json({ error: message });
+  }
+});
+
+/**
  * POST /api/voice/transcribe
  * Whisper (gpt-4o-transcribe) speech-to-text only.
  */

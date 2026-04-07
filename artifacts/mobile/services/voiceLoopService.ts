@@ -98,6 +98,17 @@ function generateId(): string {
   return `${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 }
 
+// ─── Pre-warm greeting cache ───────────────────────────────────────────────────
+// Fire-and-forget on module load: fetch the greeting TTS so the server caches it.
+// This way the first button press plays instantly (no TTS generation delay).
+setTimeout(() => {
+  const domain = process.env.EXPO_PUBLIC_DOMAIN;
+  const url = domain
+    ? `https://${domain}/api/voice/greeting?voice=nova`
+    : `http://localhost:8080/api/voice/greeting?voice=nova`;
+  fetch(url).catch(() => { /* ignore — just warming the cache */ });
+}, 3000); // 3s after module loads so the app finishes initializing first
+
 function setStatus(s: VoiceLoopStatus): void {
   _status = s;
   DeviceEventEmitter.emit(VL_STATUS, { status: s });
@@ -518,6 +529,41 @@ async function sendCurrentRecording(): Promise<void> {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
+/**
+ * Fetch and play a short greeting TTS from the server so the user hears
+ * audio confirmation immediately when activating with the screen off.
+ * Falls back silently if the network call fails.
+ */
+async function playGreeting(): Promise<void> {
+  rlog("GREET", "playGreeting() — fetching TTS...");
+  try {
+    const settings = await getSettings();
+    const domain   = process.env.EXPO_PUBLIC_DOMAIN;
+    const apiUrl   = domain
+      ? `https://${domain}/api/voice/greeting?voice=${settings.voice}`
+      : `http://localhost:8080/api/voice/greeting?voice=${settings.voice}`;
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000); // 5s timeout
+    const resp = await fetch(apiUrl, { signal: ctrl.signal });
+    clearTimeout(timer);
+
+    if (!resp.ok) { rwarn("GREET", `greeting HTTP ${resp.status}`); return; }
+    const { audio } = await resp.json() as { audio: string };
+    if (!audio) { rwarn("GREET", "greeting: empty audio"); return; }
+
+    rlog("GREET", "greeting audio received — playing...");
+    setStatus("speaking");
+    await playResponseAudio(audio);
+    rlog("GREET", "greeting played ✓");
+    if (_isActive) setStatus("idle");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    rwarn("GREET", `playGreeting() failed (ok to continue): ${msg}`);
+    if (_isActive) setStatus("idle");
+  }
+}
+
 export async function startVoiceLoop(): Promise<void> {
   rlog("LOOP", `startVoiceLoop() — _isActive=${_isActive}`);
   if (_isActive) { rlog("LOOP", "startVoiceLoop() ignored — already active"); return; }
@@ -529,7 +575,12 @@ export async function startVoiceLoop(): Promise<void> {
   } catch {}
   DeviceEventEmitter.emit(VL_SESSION, { active: true });
   emitDebug("Sesión iniciada");
-  await startListening();
+
+  // Play greeting so the user hears audio immediately (critical when screen is off).
+  // Then start listening in follow-up mode (7 s window to speak).
+  await playGreeting();
+  if (!_isActive) return; // user may have stopped the session during greeting
+  await startListening(true);
 }
 
 export async function stopVoiceLoop(): Promise<void> {
