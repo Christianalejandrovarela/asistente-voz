@@ -67,7 +67,9 @@ const VAD_SILENCE_DB      = -45;
 const VAD_SILENCE_MS      = 1500;
 const VAD_MIN_SPEECH_MS   = 300;
 const MAX_RECORDING_MS    = 60_000;
-const FOLLOW_UP_MS        = 7_000;
+// Extended from 7 s → 15 s: with screen off the user needs more time to
+// react after the "Dime, te escucho" greeting before the follow-up window closes.
+const FOLLOW_UP_MS        = 15_000;
 const MAX_MIC_RETRIES     = 3;
 const SETTINGS_KEY        = "@voice_assistant_settings";
 const CONTEXT_SUMMARY_KEY = "@context_summary";
@@ -83,6 +85,11 @@ let _status: VoiceLoopStatus = "idle";
 let _micPermissionGranted = false;
 // Mutex flag: prevents two concurrent startListening() calls from racing.
 let _startListeningInFlight = false;
+// JS-level CPU keep-alive during the listen→process→speak cycle.
+// A true PARTIAL_WAKE_LOCK is held by the BackgroundService (wakeLock:true),
+// but this rapid interval provides an extra layer of JS-thread activity so
+// Samsung One UI doesn't throttle the runtime between audio operations.
+let _cpuKeepAlive: ReturnType<typeof setInterval> | null = null;
 let _recording:  Audio.Recording | null = null;
 let _sound:      Audio.Sound | null = null;
 let _abortCtrl:  AbortController | null = null;
@@ -119,6 +126,30 @@ function clearMaxTimer(): void {
 }
 function clearFollowUpTimer(): void {
   if (_followUpTimer) { clearTimeout(_followUpTimer); _followUpTimer = null; }
+}
+
+/**
+ * JS-level CPU keep-alive: fires every 500 ms during the recording+API+TTS
+ * cycle. This supplements the BackgroundService PARTIAL_WAKE_LOCK (wakeLock:true)
+ * to prevent Samsung One UI from freezing the JS thread between audio operations.
+ * Released in stopCpuKeepAlive() when the active session ends.
+ */
+function startCpuKeepAlive(): void {
+  if (_cpuKeepAlive) return; // already running
+  _cpuKeepAlive = setInterval(() => {
+    // No-op touch: keeps the event loop from going idle between mic ops.
+    // Samsung One UI aggressively throttles idle JS threads even with wakeLock.
+    void Date.now();
+  }, 500);
+  rlog("WAKE", "CPU keep-alive started (500 ms interval)");
+}
+
+function stopCpuKeepAlive(): void {
+  if (_cpuKeepAlive) {
+    clearInterval(_cpuKeepAlive);
+    _cpuKeepAlive = null;
+    rlog("WAKE", "CPU keep-alive stopped");
+  }
 }
 
 function emitDebug(info: string): void {
@@ -236,6 +267,9 @@ async function startListening(isFollowUp = false): Promise<void> {
   if (_status !== "idle") { rlog("MIC", `startListening() early-exit: status=${_status} (expected idle)`); return; }
   if (_startListeningInFlight) { rlog("MIC", "startListening() early-exit: already in-flight (mutex)"); return; }
   _startListeningInFlight = true;
+
+  // Acquire JS-level CPU keep-alive for the full listen→process→speak cycle.
+  startCpuKeepAlive();
 
   try {
     if (!_micPermissionGranted) {
@@ -358,6 +392,7 @@ async function startListening(isFollowUp = false): Promise<void> {
 
   } catch (err) {
     _startListeningInFlight = false; // mutex released on error path
+    stopCpuKeepAlive();              // release keep-alive; re-acquired on retry
     const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
     _micRetryCount += 1;
     rerror("MIC", `startListening CATCH — attempt ${_micRetryCount}/${MAX_MIC_RETRIES}: ${msg}`);
@@ -588,6 +623,7 @@ export async function stopVoiceLoop(): Promise<void> {
   if (!_isActive) { rlog("LOOP", "stopVoiceLoop() ignored — already inactive"); return; }
   _isActive = false;
   _startListeningInFlight = false; // cancel any in-flight mic open
+  stopCpuKeepAlive();              // release JS-level CPU keep-alive
   DeviceEventEmitter.emit(VL_SESSION, { active: false });
 
   clearMaxTimer();

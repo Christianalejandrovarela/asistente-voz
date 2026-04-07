@@ -24,10 +24,14 @@ function withReactNativeTrackPlayer(config) {
      * RNTP v4 service class name.
      * react-native-background-actions v4 service class name.
      *
-     * Both need foregroundServiceType="mediaPlayback|microphone" so Android 10+
-     * permits audio capture + playback from a foreground service when the screen
-     * is off.  android:stopWithTask="false" keeps the services alive when the
-     * task is removed from the recents list.
+     * REQUIRED for Android 10+ (API 29+): both services must declare
+     *   android:foregroundServiceType="mediaPlayback|microphone"
+     * in AndroidManifest.xml so the OS grants mic access and audio playback
+     * when the screen is off / locked.  Without this, Android silently blocks
+     * the microphone even if RECORD_AUDIO permission is granted.
+     *
+     * android:stopWithTask="false" keeps the services alive when the task is
+     * removed from the recents list (Samsung "close all" swipe).
      *
      * We deliberately do NOT touch android:exported here — we let each library's
      * own manifest declare that value to avoid Gradle manifest-merger conflicts.
