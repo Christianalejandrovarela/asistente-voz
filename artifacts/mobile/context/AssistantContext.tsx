@@ -9,6 +9,7 @@ import React, {
 } from "react";
 import { Alert, DeviceEventEmitter } from "react-native";
 
+import { Audio } from "expo-av";
 import { setupTrackPlayer, destroyTrackPlayer } from "@/services/trackPlayer";
 import { startBackgroundService } from "@/services/backgroundService";
 import { requestBatteryOptimizationExemption } from "@/services/androidBatteryOptimization";
@@ -170,6 +171,29 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     let btCleanup: (() => void) | null = null;
 
     const init = async () => {
+      // ── STEP 1: Request RECORD_AUDIO permission FIRST ───────────────────────
+      // Android 14+ throws SecurityException if a Foreground Service with
+      // foregroundServiceType=microphone starts before RECORD_AUDIO is granted.
+      // This is the most common cause of immediate crash on Samsung Galaxy.
+      setDebugInfo("Solicitando permisos...");
+      const { status: micStatus } = await Audio.requestPermissionsAsync();
+      if (micStatus !== "granted") {
+        setDebugInfo("Permiso de micrófono denegado");
+        Alert.alert(
+          "Permiso de micrófono requerido",
+          "Esta app necesita acceso al micrófono para hablar con el asistente.\n\nVe a Ajustes → Aplicaciones → Asistente de Voz IA → Permisos → Micrófono y actívalo.",
+          [{ text: "OK" }]
+        );
+        return;
+      }
+
+      // ── STEP 2: Battery optimization exemption (before FGS start) ──────────
+      // On Samsung One UI, this opens the "Unmonitored apps" dialog.
+      // Must be called while the app is in foreground (before backgrounding).
+      await requestBatteryOptimizationExemption();
+
+      // ── STEP 3: Start TrackPlayer + Background Foreground Service ───────────
+      // Safe now that RECORD_AUDIO is granted — no more SecurityException crash.
       setDebugInfo("Configurando TrackPlayer...");
       let btOk = false;
       try {
@@ -193,9 +217,6 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
           setDebugInfo("Auricular desconectado");
         });
       }
-
-      // Battery optimization exemption (Android only)
-      void requestBatteryOptimizationExemption();
     };
     void init();
 
