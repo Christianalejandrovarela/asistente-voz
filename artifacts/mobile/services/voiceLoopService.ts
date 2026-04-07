@@ -108,6 +108,12 @@ let _followUpTimer: ReturnType<typeof setTimeout> | null = null;
 let _micRetryCount = 0;
 let _playbackResolve: (() => void) | null = null;
 let _contextSummary = "";
+// Pre-warmed base64 audio of the error message "Hubo un error de conexión…"
+// Fetched once on startup; played locally on API errors — no network needed.
+let _errorAudioCache: string | null = null;
+// Safety net: auto-release the mutex after 30 s if something prevents the
+// normal release paths from running.  Prevents permanent loop lockout.
+let _inFlightMutexTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -115,15 +121,26 @@ function generateId(): string {
   return `${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 }
 
-// ─── Pre-warm greeting cache ───────────────────────────────────────────────────
-// Fire-and-forget on module load: fetch the greeting TTS so the server caches it.
-// This way the first button press plays instantly (no TTS generation delay).
+// ─── Pre-warm greeting + error TTS caches ────────────────────────────────────
+// Fire-and-forget on module load.  Fetches:
+//   1. Greeting audio → server caches it so first press plays instantly.
+//   2. Error audio    → stored in _errorAudioCache; played locally when the
+//      API is unreachable — zero network dependency at error-playback time.
 setTimeout(() => {
   const domain = process.env.EXPO_PUBLIC_DOMAIN;
-  const url = domain
-    ? `https://${domain}/api/voice/greeting?voice=nova`
-    : `http://localhost:8080/api/voice/greeting?voice=nova`;
-  fetch(url).catch(() => { /* ignore — just warming the cache */ });
+  const base   = domain ? `https://${domain}` : `http://localhost:8080`;
+  // Greeting — just warm the server-side cache
+  fetch(`${base}/api/voice/greeting?voice=nova`).catch(() => {});
+  // Error TTS — store the base64 locally so it survives network outages
+  fetch(`${base}/api/voice/error?voice=nova`)
+    .then((r) => r.json())
+    .then((d: { audio?: string }) => {
+      if (d.audio) {
+        _errorAudioCache = d.audio;
+        rlog("CACHE", "error TTS pre-warmed ✓");
+      }
+    })
+    .catch(() => {}); // non-fatal — will skip TTS on first error only
 }, 3000); // 3s after module loads so the app finishes initializing first
 
 function setStatus(s: VoiceLoopStatus): void {
@@ -258,7 +275,9 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
     } : {}),
   });
 
-  const tmpPath = `${FileSystem.cacheDirectory ?? ""}ai_resp_${Date.now()}.mp3`;
+  // Fixed filename — overwritten each turn so no orphaned files accumulate
+  // in the cache dir even if a previous error skipped the finally block.
+  const tmpPath = `${FileSystem.cacheDirectory ?? ""}ai_tts_response.mp3`;
   try {
     await FileSystem.writeAsStringAsync(tmpPath, base64Audio, { encoding: "base64" });
     rlog("TTS", "playResponseAudio() — Audio.Sound.createAsync start");
@@ -310,6 +329,20 @@ async function startListening(isFollowUp = false): Promise<void> {
   if (_status !== "idle") { rlog("MIC", `startListening() early-exit: status=${_status} (expected idle)`); return; }
   if (_startListeningInFlight) { rlog("MIC", "startListening() early-exit: already in-flight (mutex)"); return; }
   _startListeningInFlight = true;
+
+  // ── Mutex safety net ───────────────────────────────────────────────────────
+  // If neither the normal release path (line below after createAsync) nor the
+  // catch block fires within 30 s, force-release the mutex and retry.
+  // Prevents a one-time stuck state from permanently killing the session.
+  if (_inFlightMutexTimer) clearTimeout(_inFlightMutexTimer);
+  _inFlightMutexTimer = setTimeout(() => {
+    if (_startListeningInFlight) {
+      rwarn("MIC", "mutex STUCK for 30s — force-releasing and restarting");
+      _startListeningInFlight = false;
+      _inFlightMutexTimer = null;
+      if (_isActive) setTimeout(() => { void startListening(true); }, 200);
+    }
+  }, 30_000);
 
   // Acquire JS-level CPU keep-alive for the full listen→process→speak cycle.
   startCpuKeepAlive();
@@ -377,7 +410,9 @@ async function startListening(isFollowUp = false): Promise<void> {
     _recording = recording;
     _micRetryCount = 0;
     setStatus(isFollowUp ? "waiting" : "recording");
-    _startListeningInFlight = false; // mutex released — recording is live
+    // Mutex released — recording is live; cancel the safety-net timer.
+    _startListeningInFlight = false;
+    if (_inFlightMutexTimer) { clearTimeout(_inFlightMutexTimer); _inFlightMutexTimer = null; }
 
     let hasSpeech       = false;
     let silenceStart: number | null = null;
@@ -465,6 +500,7 @@ async function startListening(isFollowUp = false): Promise<void> {
 
   } catch (err) {
     _startListeningInFlight = false; // mutex released on error path
+    if (_inFlightMutexTimer) { clearTimeout(_inFlightMutexTimer); _inFlightMutexTimer = null; }
     stopCpuKeepAlive();              // release keep-alive; re-acquired on retry
     const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
     _micRetryCount += 1;
@@ -632,19 +668,49 @@ async function sendCurrentRecording(): Promise<void> {
 
   } catch (err) {
     const isAbort = err instanceof Error && err.name === "AbortError";
-    if (!isAbort) {
-      const msg = err instanceof Error ? err.message : "Error desconocido";
-      rerror("API", `sendCurrentRecording CATCH: ${msg}`);
-      emitError("Error", `No se pudo procesar: ${msg}`);
-    } else {
-      rlog("API", "fetch aborted (session stopped)");
+
+    if (isAbort) {
+      // Session was stopped by the user — clean shutdown, no restart.
+      rlog("API", "fetch aborted (session stopped by user)");
+      setStatus("idle");
+      await RollingBufferManager.resume();
+      await resumeSilentTrack();
+      return;
     }
+
+    // ── Network / API error — indestructible loop recovery ────────────────────
+    // 1. Log the error (non-fatal).
+    // 2. Reset audio state so TTS playback path works.
+    // 3. Play the pre-warmed error message ("Hubo un error de conexión…").
+    // 4. Restart listening with follow-up timer → loop NEVER dies on its own.
+    const msg = err instanceof Error ? err.message : "Error desconocido";
+    rerror("API", `sendCurrentRecording CATCH: ${msg}`);
+
     setStatus("idle");
     await RollingBufferManager.resume();
     await resumeSilentTrack();
-    if (_isActive && !isAbort) {
-      rlog("LOOP", "error recovery — startListening() in 1s");
-      setTimeout(() => { void startListening(); }, 1000);
+
+    if (_isActive) {
+      // Play cached error TTS if available — zero network required.
+      if (_errorAudioCache) {
+        rlog("LOOP", "playing pre-warmed error TTS...");
+        try {
+          setStatus("speaking");
+          await playResponseAudio(_errorAudioCache);
+        } catch (e) {
+          rwarn("LOOP", `error TTS playback failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        if (_isActive) setStatus("idle");
+      }
+
+      // Always restart with follow-up mode so the silence timeout keeps the
+      // loop alive and the user can speak again without pressing the button.
+      if (_isActive) {
+        rlog("LOOP", "error recovery — restarting mic (isFollowUp=true)");
+        await RollingBufferManager.resume();
+        await resumeSilentTrack();
+        setTimeout(() => { if (_isActive) void startListening(true); }, 500);
+      }
     }
   }
 }

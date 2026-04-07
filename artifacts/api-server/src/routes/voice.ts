@@ -130,6 +130,41 @@ async function extractProfileFacts(
  * with the screen off (Bluetooth button press). Cached server-side per voice.
  */
 const greetingCache = new Map<string, string>(); // voice → base64-mp3
+const errorCache    = new Map<string, string>(); // voice → base64-mp3
+
+/**
+ * GET /api/voice/error?voice=nova
+ * Returns a short TTS error message for offline playback when the API is
+ * unreachable.  Pre-warmed on app startup so it plays instantly without
+ * any network dependency.  Cached server-side per voice.
+ */
+router.get("/voice/error", async (req: Request, res: Response) => {
+  const voice = VALID_VOICES.includes(req.query.voice as VoiceParam)
+    ? (req.query.voice as VoiceParam)
+    : "nova";
+
+  if (errorCache.has(voice)) {
+    res.json({ audio: errorCache.get(voice) });
+    return;
+  }
+
+  try {
+    const { textToSpeech } = await import(
+      "@workspace/integrations-openai-ai-server/audio"
+    );
+    const buffer = await textToSpeech(
+      "Hubo un error de conexión. Vuelvo a escucharte.",
+      voice,
+      "mp3"
+    );
+    const base64 = buffer.toString("base64");
+    errorCache.set(voice, base64);
+    res.json({ audio: base64 });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "TTS failed";
+    res.status(500).json({ error: message });
+  }
+});
 
 router.get("/voice/greeting", async (req: Request, res: Response) => {
   const voice = VALID_VOICES.includes(req.query.voice as VoiceParam)
