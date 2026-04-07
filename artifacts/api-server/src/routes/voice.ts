@@ -166,6 +166,37 @@ router.get("/voice/error", async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * GET /api/voice/prompt?voice=nova
+ * Returns the "¿Sigues ahí?" TTS for the silence-timeout nudge.
+ * Cached server-side per voice.
+ */
+const promptCache = new Map<string, string>(); // voice → base64-mp3
+
+router.get("/voice/prompt", async (req: Request, res: Response) => {
+  const voice = VALID_VOICES.includes(req.query.voice as VoiceParam)
+    ? (req.query.voice as VoiceParam)
+    : "nova";
+
+  if (promptCache.has(voice)) {
+    res.json({ audio: promptCache.get(voice) });
+    return;
+  }
+
+  try {
+    const { textToSpeech } = await import(
+      "@workspace/integrations-openai-ai-server/audio"
+    );
+    const buffer = await textToSpeech("¿Sigues ahí?", voice, "mp3");
+    const base64 = buffer.toString("base64");
+    promptCache.set(voice, base64);
+    res.json({ audio: base64 });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "TTS failed";
+    res.status(500).json({ error: message });
+  }
+});
+
 router.get("/voice/greeting", async (req: Request, res: Response) => {
   const voice = VALID_VOICES.includes(req.query.voice as VoiceParam)
     ? (req.query.voice as VoiceParam)
