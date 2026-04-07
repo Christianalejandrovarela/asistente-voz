@@ -90,6 +90,11 @@ let _startListeningInFlight = false;
 // but this rapid interval provides an extra layer of JS-thread activity so
 // Samsung One UI doesn't throttle the runtime between audio operations.
 let _cpuKeepAlive: ReturnType<typeof setInterval> | null = null;
+// Idle MediaSession watchdog: fires every 8 s between sessions to force the
+// RNTP silent track back into "playing" state in case Android stole audio
+// focus (e.g. from a RemoteDuck event fired while we were recording/speaking).
+// This keeps the MediaSession active so BT button events keep arriving.
+let _idleWatchdog: ReturnType<typeof setInterval> | null = null;
 let _recording:  Audio.Recording | null = null;
 let _sound:      Audio.Sound | null = null;
 let _abortCtrl:  AbortController | null = null;
@@ -150,6 +155,39 @@ function stopCpuKeepAlive(): void {
     _cpuKeepAlive = null;
     rlog("WAKE", "CPU keep-alive stopped");
   }
+}
+
+/**
+ * Idle MediaSession watchdog — runs between voice sessions.
+ * Every 8 s it forces the RNTP silent track back into "playing" so the
+ * Android MediaSession stays active and BT button events keep arriving.
+ * If audio focus was stolen while we were recording/speaking, Android may
+ * have paused the silent track and never auto-resumed it.  This corrects that.
+ */
+function startIdleWatchdog(): void {
+  if (_idleWatchdog) return;
+  _idleWatchdog = setInterval(() => {
+    if (_isActive) { stopIdleWatchdog(); return; } // session started, stop watchdog
+    rlog("WATCH", "idle watchdog — forcing resumeSilentTrack()");
+    void resumeSilentTrack();
+  }, 8_000);
+  rlog("WATCH", "idle watchdog started (8 s interval)");
+}
+
+function stopIdleWatchdog(): void {
+  if (_idleWatchdog) {
+    clearInterval(_idleWatchdog);
+    _idleWatchdog = null;
+    rlog("WATCH", "idle watchdog stopped");
+  }
+}
+
+/**
+ * Call this once after TrackPlayer finishes initializing to arm the idle
+ * watchdog immediately. Keeps the MediaSession alive from first launch.
+ */
+export function initIdleWatchdog(): void {
+  startIdleWatchdog();
 }
 
 function emitDebug(info: string): void {
@@ -602,6 +640,7 @@ async function playGreeting(): Promise<void> {
 export async function startVoiceLoop(): Promise<void> {
   rlog("LOOP", `startVoiceLoop() — _isActive=${_isActive}`);
   if (_isActive) { rlog("LOOP", "startVoiceLoop() ignored — already active"); return; }
+  stopIdleWatchdog(); // disarm watchdog — session is now live
   _isActive = true;
   _micRetryCount = 0;
   try {
@@ -639,10 +678,32 @@ export async function stopVoiceLoop(): Promise<void> {
     _sound = null;
   }
 
+  // ── CRITICAL: Reset audio mode to normal BEFORE resuming RNTP ─────────────
+  // startListening() sets shouldDuckAndroid:false / allowsRecordingIOS:true.
+  // If we don't reset here, Android refuses to give audio focus back to RNTP
+  // for the silent track → TrackPlayer.play() fails silently → MediaSession
+  // goes inactive → BT button events stop arriving on subsequent presses.
+  try {
+    await Audio.setAudioModeAsync({
+      allowsRecordingIOS: false,
+      playsInSilentModeIOS: true,
+      staysActiveInBackground: true,
+      ...(Platform.OS === "android" ? {
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+      } : {}),
+    });
+    rlog("LOOP", "stopVoiceLoop: audio mode reset to playback ✓");
+  } catch (e) {
+    rwarn("LOOP", `stopVoiceLoop: setAudioModeAsync failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+  }
+
   await RollingBufferManager.resume();
   await resumeSilentTrack();
   setStatus("idle");
-  rlog("LOOP", "stopVoiceLoop() ✓ session ended");
+  // Start the idle watchdog so the MediaSession stays alive between sessions.
+  startIdleWatchdog();
+  rlog("LOOP", "stopVoiceLoop() ✓ session ended — idle watchdog armed");
   emitDebug("Sesión terminada");
 }
 

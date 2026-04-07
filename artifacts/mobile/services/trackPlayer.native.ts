@@ -151,10 +151,22 @@ export async function pauseSilentTrack(): Promise<void> {
 export async function resumeSilentTrack(): Promise<void> {
   if (!isInitialized) return;
   try {
-    const { default: TrackPlayer } = await import("react-native-track-player");
+    const { default: TrackPlayer, State } = await import("react-native-track-player");
     await TrackPlayer.seekTo(0);
     await TrackPlayer.play();
-  } catch {}
+    // Verify the track actually started playing — if RNTP didn't get audio
+    // focus (e.g. because the audio session was still locked for recording),
+    // the play() call returns without error but the track stays paused.
+    // One retry after 400 ms is enough to re-claim focus in almost all cases.
+    await new Promise<void>((r) => setTimeout(r, 400));
+    const st = await TrackPlayer.getPlaybackState();
+    if (st.state !== State.Playing) {
+      console.log("[TrackPlayer] resumeSilentTrack: not playing after play() — retrying", st.state);
+      await TrackPlayer.play();
+    }
+  } catch (e) {
+    console.warn("[TrackPlayer] resumeSilentTrack failed:", e);
+  }
 }
 
 export async function destroyTrackPlayer(): Promise<void> {

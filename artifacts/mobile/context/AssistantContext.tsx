@@ -22,6 +22,7 @@ import {
   interruptSpeaking as interruptSpeakingService,
   getVoiceLoopSnapshot,
   updateLoopSettings,
+  initIdleWatchdog,
   VoiceLoopStatus,
   VoiceMessage,
   VL_STATUS,
@@ -205,6 +206,11 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         ]);
         btOk = tpResult;
         setDebugInfo(btOk ? "TrackPlayer OK" : "TrackPlayer no disponible");
+        if (btOk) {
+          // Arm the idle watchdog immediately so the MediaSession stays alive
+          // from first launch — not just after the first completed session.
+          initIdleWatchdog();
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setDebugInfo(`Error TrackPlayer: ${msg}`);
