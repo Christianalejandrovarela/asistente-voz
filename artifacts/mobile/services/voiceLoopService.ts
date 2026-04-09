@@ -301,13 +301,17 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
     _sound = null;
   }
 
-  rlog("TTS", "playResponseAudio() — setAudioModeAsync for playback");
+  // FIX: use shouldDuckAndroid:FALSE so Android grants AUDIOFOCUS_GAIN (full
+  // audio focus).  shouldDuckAndroid:true only requests AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+  // which in MODE_IN_COMMUNICATION (set by BT SCO) is NOT routed to the BT
+  // speaker or the phone speaker reliably — causing complete TTS silence.
+  rlog("TTS", "playResponseAudio() — setAudioModeAsync for playback (shouldDuck=false)");
   await Audio.setAudioModeAsync({
-    allowsRecordingIOS: true,
+    allowsRecordingIOS: false,
     playsInSilentModeIOS: true,
     staysActiveInBackground: true,
     ...(Platform.OS === "android" ? {
-      shouldDuckAndroid: true,
+      shouldDuckAndroid: false,
       playThroughEarpieceAndroid: false,
     } : {}),
   });
@@ -650,75 +654,33 @@ async function sendCurrentRecording(): Promise<void> {
       throw new Error(`API ${response.status}: ${txt}`);
     }
 
-    // ── Sentence-streaming: read NDJSON lines and play each sentence as it
-    // arrives so the user hears the first word much sooner than waiting for
-    // the entire response to be synthesised.
-    let userText      = "";
-    let assistantText = "";
-    let profileUpdates: ProfileUpdate[] = [];
-    let sentenceIdx   = 0;
+    // ── Plain JSON response (streaming removed — ReadableStream / getReader()
+    // is unreliable in React Native and caused complete TTS silence).
+    // The server generates the full TTS in one tts-1 call and returns:
+    //   { userText, assistantText, audio: base64mp3, profileUpdates?, newContextSummary? }
+    const data = await response.json() as {
+      userText: string;
+      assistantText: string;
+      audio: string;
+      profileUpdates?: ProfileUpdate[];
+      newContextSummary?: string;
+      error?: string;
+    };
 
-    const reader  = response.body!.getReader();
-    const decoder = new TextDecoder();
-    let lineBuffer = "";
+    if (data.error) throw new Error(data.error);
 
-    setStatus("speaking");
+    const userText      = data.userText      ?? "";
+    const assistantText = data.assistantText ?? "";
+    const profileUpdates: ProfileUpdate[] = data.profileUpdates ?? [];
 
-    outer: while (true) {
-      let done: boolean;
-      let value: Uint8Array | undefined;
-      try {
-        const result = await reader.read();
-        done  = result.done;
-        value = result.value as Uint8Array | undefined;
-      } catch {
-        break; // fetch aborted or network error
-      }
-      if (done || !value) break;
+    rlog("API", `response OK — user="${userText.slice(0,50)}" asst="${assistantText.slice(0,50)}" audio=${data.audio?.length ?? 0}b64`);
 
-      lineBuffer += decoder.decode(value, { stream: true });
-      const lines = lineBuffer.split("\n");
-      lineBuffer = lines.pop() ?? "";
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        let event: { type: string; text?: string; audio?: string; userText?: string;
-                     assistantText?: string; profileUpdates?: ProfileUpdate[];
-                     newContextSummary?: string; error?: string };
-        try {
-          event = JSON.parse(line);
-        } catch {
-          continue; // malformed line — skip
-        }
-
-        if (event.type === "sentence" && event.audio) {
-          sentenceIdx++;
-          rlog("TTS", `sentence ${sentenceIdx}: "${(event.text ?? "").slice(0,40)}"`);
-          await playResponseAudio(event.audio);
-          if (_bargeinFlag || !_isActive) break outer;
-
-        } else if (event.type === "done") {
-          userText      = event.userText      ?? "";
-          assistantText = event.assistantText ?? "";
-          profileUpdates = event.profileUpdates ?? [];
-          if (event.newContextSummary) {
-            _contextSummary = event.newContextSummary;
-            await clearMessages();
-            void AsyncStorage.setItem(CONTEXT_SUMMARY_KEY, event.newContextSummary);
-            DeviceEventEmitter.emit(VL_MESSAGES, { messages: [] });
-          }
-
-        } else if (event.type === "error") {
-          throw new Error(event.error ?? "Streaming error");
-        }
-      }
+    if (data.newContextSummary) {
+      _contextSummary = data.newContextSummary;
+      await clearMessages();
+      void AsyncStorage.setItem(CONTEXT_SUMMARY_KEY, data.newContextSummary);
+      DeviceEventEmitter.emit(VL_MESSAGES, { messages: [] });
     }
-
-    // Clean up the reader (no-op if already done).
-    void reader.cancel().catch(() => {});
-    _bargeinFlag = false;
-
-    rlog("API", `stream done — user="${userText.slice(0,50)}" asst="${assistantText.slice(0,50)}"`);
 
     // Apply long-term memory updates (fire-and-forget).
     if (profileUpdates.length) {
@@ -735,6 +697,19 @@ async function sendCurrentRecording(): Promise<void> {
       void addMessage(am);
       DeviceEventEmitter.emit(VL_MESSAGES, { append: [um, am] });
     }
+
+    // FIX 3 (barge-in): check the flag BEFORE playing — user may have pressed
+    // the button while the API was processing ("processing" state).
+    // Also guard _isActive in case stopVoiceLoop() ran during await fetch().
+    if (!_bargeinFlag && _isActive && data.audio) {
+      setStatus("speaking");
+      rlog("TTS", "playResponseAudio() start");
+      await playResponseAudio(data.audio);
+      rlog("TTS", "playResponseAudio() done");
+    } else {
+      rlog("TTS", `TTS skipped — bargeinFlag=${_bargeinFlag} isActive=${_isActive} hasAudio=${!!data.audio}`);
+    }
+    _bargeinFlag = false;
 
     // CRITICAL: reset audio mode + RNTP + 350ms settle before opening mic.
     await audioFlush();
@@ -915,7 +890,13 @@ export async function stopVoiceLoop(): Promise<void> {
 export function toggleVoiceLoop(): void {
   rlog("LOOP", `toggleVoiceLoop() — _isActive=${_isActive} status=${_status}`);
 
-  if (_status === "speaking" && _isActive) {
+  if (!_isActive) {
+    // Session is idle → toggle ON
+    void startVoiceLoop();
+    return;
+  }
+
+  if (_status === "speaking") {
     // ── BARGE-IN: AI is talking — interrupt TTS and go back to listening ──────
     // interruptSpeaking() resolves _playbackResolve(), which makes
     // playResponseAudio() return early.  The sendCurrentRecording() code that
@@ -923,13 +904,20 @@ export function toggleVoiceLoop(): void {
     // calls startListening() — so the mic opens without any extra work here.
     rlog("LOOP", "toggleVoiceLoop() BARGE-IN — stopping TTS, mic will open automatically");
     interruptSpeaking();
-  } else if (_isActive) {
-    // Session is running but not speaking → toggle OFF
-    void stopVoiceLoop();
-  } else {
-    // Session is idle → toggle ON
-    void startVoiceLoop();
+    return;
   }
+
+  if (_status === "processing") {
+    // ── API in-flight — set barge-in flag so TTS is skipped when it arrives ──
+    // Do NOT call stopVoiceLoop() here — the session continues after API returns.
+    rlog("LOOP", "toggleVoiceLoop() during processing — setting bargeinFlag, mic will reopen after API");
+    _bargeinFlag = true;
+    if (_abortCtrl) { _abortCtrl.abort(); _abortCtrl = null; }
+    return;
+  }
+
+  // Session is active (recording / waiting / idle) → toggle OFF
+  void stopVoiceLoop();
 }
 
 export function interruptSpeaking(): void {

@@ -12,7 +12,6 @@ const router = Router();
 type VoiceParam = "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer";
 const VALID_VOICES: VoiceParam[] = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
 
-// Compress when history reaches this threshold.
 const COMPRESS_THRESHOLD = 14;
 
 const BASE_SYSTEM_PROMPT =
@@ -58,32 +57,7 @@ function formatProfileForPrompt(profile: UserProfile): string {
 }
 
 /**
- * Split assistant text into short, playable sentences.
- * Returns at least one element (the full text as fallback).
- */
-function splitSentences(text: string): string[] {
-  // Split on . ! ? followed by whitespace (lookbehind).
-  const raw = text.split(/(?<=[.!?…])\s+/);
-  const sentences: string[] = [];
-  let pending = "";
-
-  for (const part of raw) {
-    const trimmed = part.trim();
-    if (!trimmed) continue;
-    pending = pending ? `${pending} ${trimmed}` : trimmed;
-    // Emit when the pending piece is long enough to warrant its own TTS call.
-    if (pending.length >= 20 || /[!?]$/.test(pending)) {
-      sentences.push(pending);
-      pending = "";
-    }
-  }
-  if (pending) sentences.push(pending);
-  return sentences.length > 0 ? sentences : [text.trim()];
-}
-
-/**
  * Generate a text-only response from GPT-4o-mini.
- * Fast and cheap — ideal for voice where brevity is key.
  */
 async function generateTextResponse(
   userText: string,
@@ -110,9 +84,9 @@ async function generateTextResponse(
 }
 
 /**
- * Synthesise speech for a single sentence using tts-1 (fast).
+ * Synthesise speech for the full assistant response using tts-1.
  */
-async function ttsForSentence(text: string, voice: VoiceParam): Promise<Buffer> {
+async function ttsForText(text: string, voice: VoiceParam): Promise<Buffer> {
   const resp = await openai.audio.speech.create({
     model: "tts-1",
     voice,
@@ -173,31 +147,27 @@ async function extractProfileFacts(
   }
 }
 
-// ─── Streaming helper ─────────────────────────────────────────────────────────
-
-function writeLine(res: Response, obj: object): void {
-  res.write(JSON.stringify(obj) + "\n");
-  // Flush immediately so the client receives each sentence ASAP.
-  // Works with Express's built-in streaming (no extra middleware needed).
-  if (typeof (res as unknown as { flush?: () => void }).flush === "function") {
-    (res as unknown as { flush: () => void }).flush();
-  }
-}
-
 // ─── Route ────────────────────────────────────────────────────────────────────
 
 /**
  * POST /api/voice/chat
  *
- * Request: { audio, voice, language, history, contextSummary, userProfile }
+ * Request:  { audio, voice, language, history, contextSummary, userProfile }
  *
- * Response: NDJSON stream
- *   {"type":"sentence","text":"...","audio":"<base64-mp3>"}  ← one per sentence
- *   {"type":"done","userText":"...","assistantText":"...","profileUpdates":[...]}
- *   {"type":"error","error":"..."}  ← only on failure
+ * Response (plain JSON — no streaming):
+ *   {
+ *     userText:        string,
+ *     assistantText:   string,
+ *     audio:           string,   ← base64 MP3 of full response
+ *     profileUpdates?: ProfileUpdate[],
+ *     newContextSummary?: string,
+ *   }
  *
- * The client plays each sentence audio as soon as it arrives, so the user
- * hears the first word 1-2 s sooner than waiting for the entire response.
+ * Streaming was removed because ReadableStream / getReader() is unreliable on
+ * certain React Native builds and caused complete TTS silence. The full audio
+ * is generated in one tts-1 call and returned as a single JSON object.
+ * The history is still limited to the last 3 exchanges (6 messages) on the
+ * client side to keep the payload small.
  */
 router.post("/voice/chat", async (req: Request, res: Response) => {
   const { audio, voice = "nova", language, history, contextSummary, userProfile } =
@@ -221,7 +191,7 @@ router.post("/voice/chat", async (req: Request, res: Response) => {
     : "nova";
 
   const safeHistory: ConversationHistoryEntry[] = Array.isArray(history)
-    ? history.slice(0, 6) // accept max 3 exchanges from client
+    ? history.slice(0, 6)
     : [];
 
   const safeSummary =
@@ -233,7 +203,7 @@ router.post("/voice/chat", async (req: Request, res: Response) => {
     ? userProfile
     : {};
 
-  // ── Build system prompt ─────────────────────────────────────────────────────
+  // ── Build system prompt ──────────────────────────────────────────────────────
   let systemPrompt = BASE_SYSTEM_PROMPT;
   const profileText = formatProfileForPrompt(safeProfile);
   if (profileText) {
@@ -249,76 +219,41 @@ router.post("/voice/chat", async (req: Request, res: Response) => {
 
   const shouldCompress = safeHistory.length >= COMPRESS_THRESHOLD;
 
-  // ── Set up streaming response ───────────────────────────────────────────────
-  res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
-  res.setHeader("Transfer-Encoding", "chunked");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("X-Accel-Buffering", "no"); // disable nginx buffering
-
   try {
     const { buffer, format } = await ensureCompatibleFormat(audioBuffer);
 
-    // ── Step 1: STT (transcribe audio → text) ────────────────────────────────
+    // Step 1: STT
     const userText = await speechToText(buffer, format, language);
 
-    // ── Step 2: Profile extraction + context compression (parallel) ───────────
-    const extractPromise   = extractProfileFacts(userText, safeProfile);
-    const compressPromise  = shouldCompress
+    // Step 2: Profile extraction + context compression (parallel with LLM)
+    const extractPromise  = extractProfileFacts(userText, safeProfile);
+    const compressPromise = shouldCompress
       ? compressContext(safeHistory)
       : Promise.resolve(undefined);
 
-    // ── Step 3: LLM text generation ───────────────────────────────────────────
+    // Step 3: LLM text generation
     const assistantText = await generateTextResponse(userText, safeHistory, systemPrompt);
 
-    // ── Step 4: Split into sentences & stream TTS one sentence at a time ──────
-    const sentences = splitSentences(assistantText);
-
-    // Pipeline: start generating sentence N+1 TTS while sentence N is being
-    // sent to the client (they download it + play it ≈ 1-3s per sentence).
-    let nextAudioPromise: Promise<Buffer> | null = null;
-
-    for (let i = 0; i < sentences.length; i++) {
-      const sentenceAudio = nextAudioPromise
-        ? await nextAudioPromise
-        : await ttsForSentence(sentences[i]!, selectedVoice);
-
-      // Pre-generate next sentence in parallel with the client playing this one.
-      nextAudioPromise =
-        i + 1 < sentences.length
-          ? ttsForSentence(sentences[i + 1]!, selectedVoice)
-          : null;
-
-      writeLine(res, {
-        type:  "sentence",
-        text:  sentences[i],
-        audio: sentenceAudio.toString("base64"),
-      });
-    }
-
-    // ── Step 5: Collect deferred results and send done event ──────────────────
-    const [newContextSummary, profileUpdates] = await Promise.all([
+    // Step 4: TTS (full response in one call) + collect deferred results in parallel
+    const [ttsBuffer, newContextSummary, profileUpdates] = await Promise.all([
+      ttsForText(assistantText, selectedVoice),
       compressPromise,
       extractPromise,
     ]);
 
-    writeLine(res, {
-      type:          "done",
+    const responseBody: Record<string, unknown> = {
       userText,
       assistantText,
-      ...(newContextSummary !== undefined ? { newContextSummary } : {}),
-      ...(profileUpdates.length > 0 ? { profileUpdates } : {}),
-    });
+      audio: ttsBuffer.toString("base64"),
+    };
+    if (profileUpdates.length > 0)    responseBody.profileUpdates    = profileUpdates;
+    if (newContextSummary !== undefined) responseBody.newContextSummary = newContextSummary;
 
-    res.end();
+    res.json(responseBody);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Voice processing failed";
     req.log?.error({ err }, "Voice chat error");
-    try {
-      writeLine(res, { type: "error", error: message });
-      res.end();
-    } catch {
-      // response already ended
-    }
+    res.status(500).json({ error: message });
   }
 });
 
