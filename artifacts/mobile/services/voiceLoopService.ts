@@ -36,6 +36,7 @@ import {
 import { pauseSilentTrack, resumeSilentTrack } from "@/services/trackPlayer";
 import { RollingBufferManager } from "@/services/rollingBufferManager";
 import { rlog, rwarn, rerror } from "@/services/remoteLogger";
+import { startSco, waitForScoConnected, stopSco } from "@/services/bluetoothScoService";
 import {
   getUserProfile,
   applyProfileUpdates,
@@ -107,6 +108,7 @@ let _maxTimer:   ReturnType<typeof setTimeout> | null = null;
 let _followUpTimer: ReturnType<typeof setTimeout> | null = null;
 let _micRetryCount = 0;
 let _playbackResolve: (() => void) | null = null;
+let _bargeinFlag = false; // set by interruptSpeaking() to abort sentence playback loop
 let _contextSummary = "";
 // Pre-warmed base64 audio of the error message "Hubo un error de conexión…"
 // Fetched once on startup; played locally on API errors — no network needed.
@@ -604,10 +606,9 @@ async function sendCurrentRecording(): Promise<void> {
     await purgeOldMessages();
     const [settings, history, userProfile] = await Promise.all([
       getSettings(),
-      // Limit to last 8 exchanges (16 messages) — keeps payload small and API fast.
-      // Older context is preserved via contextSummary rolling compression.
-      getMessages(16),
-      // Load the persistent user profile for long-term memory injection.
+      // Thin client: send only the last 3 exchanges (6 messages) to keep the
+      // payload minimal and the round-trip fast.
+      getMessages(6),
       getUserProfile(),
     ]);
     const contextText  = RollingBufferManager.getContextText();
@@ -619,6 +620,7 @@ async function sendCurrentRecording(): Promise<void> {
     }
 
     rlog("API", `fetch POST ${apiUrl} — history=${payload.length} msgs profile=${userProfile.name ?? "(anon)"}`);
+    _bargeinFlag = false;
     _abortCtrl = new AbortController();
     const response = await fetch(apiUrl, {
       method: "POST",
@@ -627,7 +629,7 @@ async function sendCurrentRecording(): Promise<void> {
         audio: base64Audio,
         voice: settings.voice,
         language: settings.language,
-        history: payload.slice(-16),
+        history: payload.slice(-6), // thin client: last 3 exchanges
         contextSummary: _contextSummary || undefined,
         userProfile,
       }),
@@ -648,50 +650,93 @@ async function sendCurrentRecording(): Promise<void> {
       throw new Error(`API ${response.status}: ${txt}`);
     }
 
-    interface ApiResp {
-      audio: string;
-      userText: string;
-      assistantText: string;
-      newContextSummary?: string;
-      profileUpdates?: ProfileUpdate[];
-    }
-    const data = await response.json() as ApiResp;
-    rlog("API", `response OK — user="${data.userText.slice(0,50)}" asst="${data.assistantText.slice(0,50)}"`);
+    // ── Sentence-streaming: read NDJSON lines and play each sentence as it
+    // arrives so the user hears the first word much sooner than waiting for
+    // the entire response to be synthesised.
+    let userText      = "";
+    let assistantText = "";
+    let profileUpdates: ProfileUpdate[] = [];
+    let sentenceIdx   = 0;
 
-    // Apply long-term memory updates (fire-and-forget — non-blocking for TTS).
-    if (data.profileUpdates?.length) {
-      rlog("PROFILE", `${data.profileUpdates.length} update(s) extracted — applying...`);
-      void applyProfileUpdates(data.profileUpdates);
-    }
-
-    const now = Date.now();
-    if (data.newContextSummary) {
-      _contextSummary = data.newContextSummary;
-      await clearMessages();
-      void AsyncStorage.setItem(CONTEXT_SUMMARY_KEY, data.newContextSummary);
-      DeviceEventEmitter.emit(VL_MESSAGES, { messages: [] });
-    }
-
-    const um: VoiceMessage = { id: generateId(), role: "user",      text: data.userText,      timestamp: now };
-    const am: VoiceMessage = { id: generateId(), role: "assistant", text: data.assistantText, timestamp: now + 1 };
-    void addMessage(um);
-    void addMessage(am);
-    DeviceEventEmitter.emit(VL_MESSAGES, { append: [um, am] });
-
-    if (!_isActive) {
-      setStatus("idle");
-      await audioFlush();
-      return;
-    }
+    const reader  = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let lineBuffer = "";
 
     setStatus("speaking");
-    rlog("TTS", "starting playResponseAudio()");
-    await playResponseAudio(data.audio);
-    rlog("TTS", "playResponseAudio() finished — audioFlush() next");
+
+    outer: while (true) {
+      let done: boolean;
+      let value: Uint8Array | undefined;
+      try {
+        const result = await reader.read();
+        done  = result.done;
+        value = result.value as Uint8Array | undefined;
+      } catch {
+        break; // fetch aborted or network error
+      }
+      if (done || !value) break;
+
+      lineBuffer += decoder.decode(value, { stream: true });
+      const lines = lineBuffer.split("\n");
+      lineBuffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let event: { type: string; text?: string; audio?: string; userText?: string;
+                     assistantText?: string; profileUpdates?: ProfileUpdate[];
+                     newContextSummary?: string; error?: string };
+        try {
+          event = JSON.parse(line);
+        } catch {
+          continue; // malformed line — skip
+        }
+
+        if (event.type === "sentence" && event.audio) {
+          sentenceIdx++;
+          rlog("TTS", `sentence ${sentenceIdx}: "${(event.text ?? "").slice(0,40)}"`);
+          await playResponseAudio(event.audio);
+          if (_bargeinFlag || !_isActive) break outer;
+
+        } else if (event.type === "done") {
+          userText      = event.userText      ?? "";
+          assistantText = event.assistantText ?? "";
+          profileUpdates = event.profileUpdates ?? [];
+          if (event.newContextSummary) {
+            _contextSummary = event.newContextSummary;
+            await clearMessages();
+            void AsyncStorage.setItem(CONTEXT_SUMMARY_KEY, event.newContextSummary);
+            DeviceEventEmitter.emit(VL_MESSAGES, { messages: [] });
+          }
+
+        } else if (event.type === "error") {
+          throw new Error(event.error ?? "Streaming error");
+        }
+      }
+    }
+
+    // Clean up the reader (no-op if already done).
+    void reader.cancel().catch(() => {});
+    _bargeinFlag = false;
+
+    rlog("API", `stream done — user="${userText.slice(0,50)}" asst="${assistantText.slice(0,50)}"`);
+
+    // Apply long-term memory updates (fire-and-forget).
+    if (profileUpdates.length) {
+      rlog("PROFILE", `${profileUpdates.length} update(s)`);
+      void applyProfileUpdates(profileUpdates);
+    }
+
+    // Persist messages for UI display.
+    if (userText || assistantText) {
+      const now = Date.now();
+      const um: VoiceMessage = { id: generateId(), role: "user",      text: userText,      timestamp: now };
+      const am: VoiceMessage = { id: generateId(), role: "assistant", text: assistantText, timestamp: now + 1 };
+      void addMessage(um);
+      void addMessage(am);
+      DeviceEventEmitter.emit(VL_MESSAGES, { append: [um, am] });
+    }
 
     // CRITICAL: reset audio mode + RNTP + 350ms settle before opening mic.
-    // Without this Samsung One UI cannot transition audio focus and
-    // Recording.createAsync() fails silently, breaking the loop.
     await audioFlush();
 
     if (_isActive) {
@@ -801,6 +846,13 @@ export async function startVoiceLoop(): Promise<void> {
   DeviceEventEmitter.emit(VL_SESSION, { active: true });
   emitDebug("Sesión iniciada");
 
+  // ── Bluetooth SCO: route microphone through BT headset ─────────────────────
+  // startSco() registers a BroadcastReceiver for ACTION_SCO_AUDIO_STATE_UPDATED.
+  // waitForScoConnected() blocks until the headset confirms SCO is connected
+  // (or times out after 3 s → falls back to phone mic transparently).
+  await startSco();
+  await waitForScoConnected(3000);
+
   // Play greeting so the user hears audio immediately (critical when screen is off).
   // Then start listening in follow-up mode (7 s window to speak).
   await playGreeting();
@@ -852,6 +904,8 @@ export async function stopVoiceLoop(): Promise<void> {
   await RollingBufferManager.resume();
   await resumeSilentTrack();
   setStatus("idle");
+  // Release BT SCO audio channel.
+  void stopSco();
   // Start the idle watchdog so the MediaSession stays alive between sessions.
   startIdleWatchdog();
   rlog("LOOP", "stopVoiceLoop() ✓ session ended — idle watchdog armed");
@@ -881,6 +935,10 @@ export function toggleVoiceLoop(): void {
 export function interruptSpeaking(): void {
   rlog("LOOP", `interruptSpeaking() — status=${_status}`);
   if (_status !== "speaking") return;
+  // Barge-in: stop the current sentence audio immediately (fire-and-forget)
+  // then signal the sentence loop to abort remaining sentences.
+  _bargeinFlag = true;
+  if (_sound) { void _sound.stopAsync().catch(() => {}); }
   if (_playbackResolve) { _playbackResolve(); _playbackResolve = null; }
 }
 
