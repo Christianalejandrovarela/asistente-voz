@@ -172,23 +172,35 @@ module.exports = function withBluetoothSco(config) {
       if (fs.existsSync(mainAppPath)) {
         let src = fs.readFileSync(mainAppPath, "utf8");
 
-        const marker    = "add(BluetoothScoPackage())";
-        const addLine   = "\n        add(BluetoothScoPackage())";
+        const marker = "BluetoothScoPackage()";
 
         if (!src.includes(marker)) {
-          // Try to inject after PackageList block.
-          src = src.replace(
-            /PackageList\(this\)\.packages/,
-            `PackageList(this).packages.also { pkgs ->${addLine}\n        }`
+          // Strategy 1: transform  PackageList(this).packages
+          // into  PackageList(this).packages.apply { add(BluetoothScoPackage()) }
+          // "apply" keeps `this` as the ArrayList so add() resolves.
+          const patched1 = src.replace(
+            /PackageList\(this\)\.packages(?!\.apply)/,
+            "PackageList(this).packages.apply { add(BluetoothScoPackage()) }"
           );
-          // Fallback: inject inside getPackages return if above didn't match.
-          if (!src.includes(marker)) {
-            src = src.replace(
-              /PackageList\(this\)\.packages\.apply\s*\{/,
-              `PackageList(this).packages.apply {\n        add(BluetoothScoPackage())`
+          if (patched1.includes(marker)) {
+            fs.writeFileSync(mainAppPath, patched1);
+          } else {
+            // Strategy 2: inject packages.add() after val packages = ... line.
+            const patched2 = src.replace(
+              /(val packages = PackageList\(this\)\.packages\s*\n)/,
+              "$1          packages.add(BluetoothScoPackage())\n"
             );
+            if (patched2.includes(marker)) {
+              fs.writeFileSync(mainAppPath, patched2);
+            } else {
+              // Strategy 3: inject before `return packages`
+              const patched3 = src.replace(
+                /(\n\s*return packages)/,
+                "\n          packages.add(BluetoothScoPackage())$1"
+              );
+              fs.writeFileSync(mainAppPath, patched3);
+            }
           }
-          fs.writeFileSync(mainAppPath, src);
         }
       }
 
