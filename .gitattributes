@@ -17,3 +17,4 @@ downloads/asistente-voz-build33.apk filter=lfs diff=lfs merge=lfs -text
 downloads/asistente-voz-build34.apk filter=lfs diff=lfs merge=lfs -text
 artifacts/api-server/downloads/asistente-voz-latest.apk filter=lfs diff=lfs merge=lfs -text
 downloads/asistente-voz-build40.apk filter=lfs diff=lfs merge=lfs -text
+downloads/asistente-voz-build41.apk filter=lfs diff=lfs merge=lfs -text
