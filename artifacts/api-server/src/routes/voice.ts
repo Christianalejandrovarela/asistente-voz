@@ -1,24 +1,12 @@
 import { Router, type Request, type Response } from "express";
-import OpenAI from "openai";
 import {
   openai,
   speechToText,
+  textToSpeech,
   ensureCompatibleFormat,
   compressContext,
   type ConversationHistoryEntry,
 } from "@workspace/integrations-openai-ai-server/audio";
-
-// Direct OpenAI client for TTS — the Replit AI proxy does not support POST /audio/speech
-// Lazy-initialized so the server starts even if OPENAI_API_KEY is not configured yet
-let _ttsOpenai: OpenAI | null = null;
-function getTtsClient(): OpenAI {
-  if (!_ttsOpenai) {
-    const key = process.env.OPENAI_API_KEY;
-    if (!key) throw new Error("OPENAI_API_KEY is not set. Please add it as a secret.");
-    _ttsOpenai = new OpenAI({ apiKey: key });
-  }
-  return _ttsOpenai;
-}
 
 const router = Router();
 
@@ -100,13 +88,7 @@ async function generateTextResponse(
  * Synthesise speech for the full assistant response using tts-1.
  */
 async function ttsForText(text: string, voice: VoiceParam): Promise<Buffer> {
-  const resp = await getTtsClient().audio.speech.create({
-    model: "tts-1",
-    voice,
-    input: text,
-    response_format: "mp3",
-  });
-  return Buffer.from(await resp.arrayBuffer());
+  return await textToSpeech(text, voice, "mp3");
 }
 
 /**
@@ -182,6 +164,42 @@ async function extractProfileFacts(
  * The history is still limited to the last 3 exchanges (6 messages) on the
  * client side to keep the payload small.
  */
+// ─── Pre-warm / utility TTS routes ───────────────────────────────────────────
+
+// Greeting audio — warm the cache and return TTS of the greeting
+router.get("/voice/greeting", async (req: Request, res: Response) => {
+  const voice = (req.query.voice as VoiceParam) || "nova";
+  try {
+    const buf = await textToSpeech("Hola, soy tu asistente de voz. ¿En qué puedo ayudarte?", voice, "mp3");
+    res.json({ audio: buf.toString("base64") });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "TTS error" });
+  }
+});
+
+// Error audio — returned to client to play locally when API is unreachable
+router.get("/voice/error", async (req: Request, res: Response) => {
+  const voice = (req.query.voice as VoiceParam) || "nova";
+  try {
+    const buf = await textToSpeech("Hubo un error de conexión. Por favor, intenta de nuevo.", voice, "mp3");
+    res.json({ audio: buf.toString("base64") });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "TTS error" });
+  }
+});
+
+// Silence nudge audio — "¿Sigues ahí?" played on silence timeout
+router.get("/voice/prompt", async (req: Request, res: Response) => {
+  const voice = (req.query.voice as VoiceParam) || "nova";
+  try {
+    const buf = await textToSpeech("¿Sigues ahí?", voice, "mp3");
+    res.json({ audio: buf.toString("base64") });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "TTS error" });
+  }
+});
+
+// ─── Main voice chat route ────────────────────────────────────────────────────
 router.post("/voice/chat", async (req: Request, res: Response) => {
   const { audio, voice = "nova", language, history, contextSummary, userProfile } =
     req.body as {
