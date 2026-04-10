@@ -36,6 +36,7 @@ import {
 import { pauseSilentTrack, resumeSilentTrack } from "@/services/trackPlayer";
 import { RollingBufferManager } from "@/services/rollingBufferManager";
 import { rlog, rwarn, rerror } from "@/services/remoteLogger";
+import { startSco, waitForScoConnected, stopSco } from "@/services/bluetoothScoService";
 import {
   getUserProfile,
   applyProfileUpdates,
@@ -107,6 +108,7 @@ let _maxTimer:   ReturnType<typeof setTimeout> | null = null;
 let _followUpTimer: ReturnType<typeof setTimeout> | null = null;
 let _micRetryCount = 0;
 let _playbackResolve: (() => void) | null = null;
+let _bargeinFlag = false; // set by interruptSpeaking() to abort sentence playback loop
 let _contextSummary = "";
 // Pre-warmed base64 audio of the error message "Hubo un error de conexión…"
 // Fetched once on startup; played locally on API errors — no network needed.
@@ -299,13 +301,17 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
     _sound = null;
   }
 
-  rlog("TTS", "playResponseAudio() — setAudioModeAsync for playback");
+  // FIX: use shouldDuckAndroid:FALSE so Android grants AUDIOFOCUS_GAIN (full
+  // audio focus).  shouldDuckAndroid:true only requests AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+  // which in MODE_IN_COMMUNICATION (set by BT SCO) is NOT routed to the BT
+  // speaker or the phone speaker reliably — causing complete TTS silence.
+  rlog("TTS", "playResponseAudio() — setAudioModeAsync for playback (shouldDuck=false)");
   await Audio.setAudioModeAsync({
-    allowsRecordingIOS: true,
+    allowsRecordingIOS: false,
     playsInSilentModeIOS: true,
     staysActiveInBackground: true,
     ...(Platform.OS === "android" ? {
-      shouldDuckAndroid: true,
+      shouldDuckAndroid: false,
       playThroughEarpieceAndroid: false,
     } : {}),
   });
@@ -604,10 +610,9 @@ async function sendCurrentRecording(): Promise<void> {
     await purgeOldMessages();
     const [settings, history, userProfile] = await Promise.all([
       getSettings(),
-      // Limit to last 8 exchanges (16 messages) — keeps payload small and API fast.
-      // Older context is preserved via contextSummary rolling compression.
-      getMessages(16),
-      // Load the persistent user profile for long-term memory injection.
+      // Thin client: send only the last 3 exchanges (6 messages) to keep the
+      // payload minimal and the round-trip fast.
+      getMessages(6),
       getUserProfile(),
     ]);
     const contextText  = RollingBufferManager.getContextText();
@@ -619,6 +624,7 @@ async function sendCurrentRecording(): Promise<void> {
     }
 
     rlog("API", `fetch POST ${apiUrl} — history=${payload.length} msgs profile=${userProfile.name ?? "(anon)"}`);
+    _bargeinFlag = false;
     _abortCtrl = new AbortController();
     const response = await fetch(apiUrl, {
       method: "POST",
@@ -627,7 +633,7 @@ async function sendCurrentRecording(): Promise<void> {
         audio: base64Audio,
         voice: settings.voice,
         language: settings.language,
-        history: payload.slice(-16),
+        history: payload.slice(-6), // thin client: last 3 exchanges
         contextSummary: _contextSummary || undefined,
         userProfile,
       }),
@@ -648,23 +654,27 @@ async function sendCurrentRecording(): Promise<void> {
       throw new Error(`API ${response.status}: ${txt}`);
     }
 
-    interface ApiResp {
-      audio: string;
+    // ── Plain JSON response (streaming removed — ReadableStream / getReader()
+    // is unreliable in React Native and caused complete TTS silence).
+    // The server generates the full TTS in one tts-1 call and returns:
+    //   { userText, assistantText, audio: base64mp3, profileUpdates?, newContextSummary? }
+    const data = await response.json() as {
       userText: string;
       assistantText: string;
-      newContextSummary?: string;
+      audio: string;
       profileUpdates?: ProfileUpdate[];
-    }
-    const data = await response.json() as ApiResp;
-    rlog("API", `response OK — user="${data.userText.slice(0,50)}" asst="${data.assistantText.slice(0,50)}"`);
+      newContextSummary?: string;
+      error?: string;
+    };
 
-    // Apply long-term memory updates (fire-and-forget — non-blocking for TTS).
-    if (data.profileUpdates?.length) {
-      rlog("PROFILE", `${data.profileUpdates.length} update(s) extracted — applying...`);
-      void applyProfileUpdates(data.profileUpdates);
-    }
+    if (data.error) throw new Error(data.error);
 
-    const now = Date.now();
+    const userText      = data.userText      ?? "";
+    const assistantText = data.assistantText ?? "";
+    const profileUpdates: ProfileUpdate[] = data.profileUpdates ?? [];
+
+    rlog("API", `response OK — user="${userText.slice(0,50)}" asst="${assistantText.slice(0,50)}" audio=${data.audio?.length ?? 0}b64`);
+
     if (data.newContextSummary) {
       _contextSummary = data.newContextSummary;
       await clearMessages();
@@ -672,26 +682,36 @@ async function sendCurrentRecording(): Promise<void> {
       DeviceEventEmitter.emit(VL_MESSAGES, { messages: [] });
     }
 
-    const um: VoiceMessage = { id: generateId(), role: "user",      text: data.userText,      timestamp: now };
-    const am: VoiceMessage = { id: generateId(), role: "assistant", text: data.assistantText, timestamp: now + 1 };
-    void addMessage(um);
-    void addMessage(am);
-    DeviceEventEmitter.emit(VL_MESSAGES, { append: [um, am] });
-
-    if (!_isActive) {
-      setStatus("idle");
-      await audioFlush();
-      return;
+    // Apply long-term memory updates (fire-and-forget).
+    if (profileUpdates.length) {
+      rlog("PROFILE", `${profileUpdates.length} update(s)`);
+      void applyProfileUpdates(profileUpdates);
     }
 
-    setStatus("speaking");
-    rlog("TTS", "starting playResponseAudio()");
-    await playResponseAudio(data.audio);
-    rlog("TTS", "playResponseAudio() finished — audioFlush() next");
+    // Persist messages for UI display.
+    if (userText || assistantText) {
+      const now = Date.now();
+      const um: VoiceMessage = { id: generateId(), role: "user",      text: userText,      timestamp: now };
+      const am: VoiceMessage = { id: generateId(), role: "assistant", text: assistantText, timestamp: now + 1 };
+      void addMessage(um);
+      void addMessage(am);
+      DeviceEventEmitter.emit(VL_MESSAGES, { append: [um, am] });
+    }
+
+    // FIX 3 (barge-in): check the flag BEFORE playing — user may have pressed
+    // the button while the API was processing ("processing" state).
+    // Also guard _isActive in case stopVoiceLoop() ran during await fetch().
+    if (!_bargeinFlag && _isActive && data.audio) {
+      setStatus("speaking");
+      rlog("TTS", "playResponseAudio() start");
+      await playResponseAudio(data.audio);
+      rlog("TTS", "playResponseAudio() done");
+    } else {
+      rlog("TTS", `TTS skipped — bargeinFlag=${_bargeinFlag} isActive=${_isActive} hasAudio=${!!data.audio}`);
+    }
+    _bargeinFlag = false;
 
     // CRITICAL: reset audio mode + RNTP + 350ms settle before opening mic.
-    // Without this Samsung One UI cannot transition audio focus and
-    // Recording.createAsync() fails silently, breaking the loop.
     await audioFlush();
 
     if (_isActive) {
@@ -801,6 +821,13 @@ export async function startVoiceLoop(): Promise<void> {
   DeviceEventEmitter.emit(VL_SESSION, { active: true });
   emitDebug("Sesión iniciada");
 
+  // ── Bluetooth SCO: route microphone through BT headset ─────────────────────
+  // startSco() registers a BroadcastReceiver for ACTION_SCO_AUDIO_STATE_UPDATED.
+  // waitForScoConnected() blocks until the headset confirms SCO is connected
+  // (or times out after 3 s → falls back to phone mic transparently).
+  await startSco();
+  await waitForScoConnected(3000);
+
   // Play greeting so the user hears audio immediately (critical when screen is off).
   // Then start listening in follow-up mode (7 s window to speak).
   await playGreeting();
@@ -852,6 +879,8 @@ export async function stopVoiceLoop(): Promise<void> {
   await RollingBufferManager.resume();
   await resumeSilentTrack();
   setStatus("idle");
+  // Release BT SCO audio channel.
+  void stopSco();
   // Start the idle watchdog so the MediaSession stays alive between sessions.
   startIdleWatchdog();
   rlog("LOOP", "stopVoiceLoop() ✓ session ended — idle watchdog armed");
@@ -861,7 +890,13 @@ export async function stopVoiceLoop(): Promise<void> {
 export function toggleVoiceLoop(): void {
   rlog("LOOP", `toggleVoiceLoop() — _isActive=${_isActive} status=${_status}`);
 
-  if (_status === "speaking" && _isActive) {
+  if (!_isActive) {
+    // Session is idle → toggle ON
+    void startVoiceLoop();
+    return;
+  }
+
+  if (_status === "speaking") {
     // ── BARGE-IN: AI is talking — interrupt TTS and go back to listening ──────
     // interruptSpeaking() resolves _playbackResolve(), which makes
     // playResponseAudio() return early.  The sendCurrentRecording() code that
@@ -869,18 +904,29 @@ export function toggleVoiceLoop(): void {
     // calls startListening() — so the mic opens without any extra work here.
     rlog("LOOP", "toggleVoiceLoop() BARGE-IN — stopping TTS, mic will open automatically");
     interruptSpeaking();
-  } else if (_isActive) {
-    // Session is running but not speaking → toggle OFF
-    void stopVoiceLoop();
-  } else {
-    // Session is idle → toggle ON
-    void startVoiceLoop();
+    return;
   }
+
+  if (_status === "processing") {
+    // ── API in-flight — set barge-in flag so TTS is skipped when it arrives ──
+    // Do NOT call stopVoiceLoop() here — the session continues after API returns.
+    rlog("LOOP", "toggleVoiceLoop() during processing — setting bargeinFlag, mic will reopen after API");
+    _bargeinFlag = true;
+    if (_abortCtrl) { _abortCtrl.abort(); _abortCtrl = null; }
+    return;
+  }
+
+  // Session is active (recording / waiting / idle) → toggle OFF
+  void stopVoiceLoop();
 }
 
 export function interruptSpeaking(): void {
   rlog("LOOP", `interruptSpeaking() — status=${_status}`);
   if (_status !== "speaking") return;
+  // Barge-in: stop the current sentence audio immediately (fire-and-forget)
+  // then signal the sentence loop to abort remaining sentences.
+  _bargeinFlag = true;
+  if (_sound) { void _sound.stopAsync().catch(() => {}); }
   if (_playbackResolve) { _playbackResolve(); _playbackResolve = null; }
 }
 

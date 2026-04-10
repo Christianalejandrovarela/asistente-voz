@@ -38,7 +38,9 @@
         "android.permission.MODIFY_AUDIO_SETTINGS",
         "android.permission.BLUETOOTH",
         "android.permission.BLUETOOTH_CONNECT",
-        "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
+        "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CHANGE_WIFI_STATE"
       ]
     },
     "web": {
@@ -59,7 +61,8 @@
           "microphonePermission": "Necesitamos el micrófono para que puedas hablar con el asistente de voz IA."
         }
       ],
-      "./plugins/withReactNativeTrackPlayer"
+      "./plugins/withReactNativeTrackPlayer",
+      "./plugins/withBluetoothSco"
     ],
     "experiments": {
       "typedRoutes": true,
