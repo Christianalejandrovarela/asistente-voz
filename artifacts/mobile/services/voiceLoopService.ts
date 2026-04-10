@@ -91,11 +91,16 @@ let _status: VoiceLoopStatus = "idle";
 let _micPermissionGranted = false;
 // Mutex flag: prevents two concurrent startListening() calls from racing.
 let _startListeningInFlight = false;
-// JS-level CPU keep-alive during the listen→process→speak cycle.
-// A true PARTIAL_WAKE_LOCK is held by the BackgroundService (wakeLock:true),
-// but this rapid interval provides an extra layer of JS-thread activity so
-// Samsung One UI doesn't throttle the runtime between audio operations.
+// JS-level CPU keep-alive for the ENTIRE voice session (start → stop).
+// Fires every 250 ms to keep the Samsung One UI JS thread warm regardless of
+// what phase the loop is in (recording, API call, TTS, audioFlush…).
+// A true PARTIAL_WAKE_LOCK is also held by the BackgroundService (wakeLock:true).
+// NEVER stopped mid-session — only in stopVoiceLoop().
 let _cpuKeepAlive: ReturnType<typeof setInterval> | null = null;
+// TTS playing watchdog: screen-off can freeze onPlaybackStatusUpdate callbacks,
+// leaving the loop stuck in "speaking" forever.  Polls the sound every 2.5 s
+// and force-resolves playback if the audio has finished without a callback.
+let _speakingWatchdog: ReturnType<typeof setInterval> | null = null;
 // Idle MediaSession watchdog: fires every 8 s between sessions to force the
 // RNTP silent track back into "playing" state in case Android stole audio
 // focus (e.g. from a RemoteDuck event fired while we were recording/speaking).
@@ -203,9 +208,10 @@ function startCpuKeepAlive(): void {
   _cpuKeepAlive = setInterval(() => {
     // No-op touch: keeps the event loop from going idle between mic ops.
     // Samsung One UI aggressively throttles idle JS threads even with wakeLock.
+    // 250 ms (was 500) — more aggressive to survive deep Doze between TTS and mic.
     void Date.now();
-  }, 500);
-  rlog("WAKE", "CPU keep-alive started (500 ms interval)");
+  }, 250);
+  rlog("WAKE", "CPU keep-alive started (250 ms interval)");
 }
 
 function stopCpuKeepAlive(): void {
@@ -293,6 +299,13 @@ async function readUriAsBase64(uri: string): Promise<string> {
 
 // ─── Audio playback (sequential — no concurrent recording) ────────────────────
 
+function stopSpeakingWatchdog(): void {
+  if (_speakingWatchdog) {
+    clearInterval(_speakingWatchdog);
+    _speakingWatchdog = null;
+  }
+}
+
 async function playResponseAudio(base64Audio: string): Promise<void> {
   if (_sound !== null) {
     rlog("TTS", "playResponseAudio() — cleaning up previous sound");
@@ -301,18 +314,20 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
     _sound = null;
   }
 
-  // shouldDuckAndroid:false → AUDIOFOCUS_GAIN (full priority — required in
-  // MODE_IN_COMMUNICATION / BT SCO, duck gives TRANSIENT_MAY_DUCK which is silent).
-  // playThroughEarpieceAndroid:true → keeps speakerphone OFF so Android routes
-  // TTS through BT SCO (USAGE_VOICE_COMMUNICATION path) instead of the loudspeaker.
-  rlog("TTS", "playResponseAudio() — setAudioModeAsync for playback (shouldDuck=false, earpiece=true)");
+  // FIX 1 — STREAM_MUSIC / A2DP for full volume:
+  // playThroughEarpieceAndroid:false → AudioManager MODE_NORMAL → Android routes
+  // TTS through STREAM_MUSIC at full media volume (A2DP BT or loudspeaker).
+  // Previously true (MODE_IN_COMMUNICATION / SCO narrow-band) caused low volume
+  // because BT SCO is a 8-16 kHz call-grade codec, not a media codec.
+  // shouldDuckAndroid:false → AUDIOFOCUS_GAIN (exclusive full-priority focus).
+  rlog("TTS", "playResponseAudio() — setAudioModeAsync (shouldDuck=false, earpiece=false→STREAM_MUSIC)");
   await Audio.setAudioModeAsync({
     allowsRecordingIOS: false,
     playsInSilentModeIOS: true,
     staysActiveInBackground: true,
     ...(Platform.OS === "android" ? {
       shouldDuckAndroid: false,
-      playThroughEarpieceAndroid: true,
+      playThroughEarpieceAndroid: false,
     } : {}),
   });
 
@@ -348,15 +363,57 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
     _sound = sound;
     rlog("TTS", "playResponseAudio() — sound playing, waiting for finish...");
 
+    // FIX 3 — Speaking watchdog (anti-freeze on screen-off):
+    // onPlaybackStatusUpdate callbacks stop firing when the screen is off on
+    // Samsung One UI, leaving the loop permanently stuck in "speaking".
+    // Every 2.5 s we poll getStatusAsync() directly and force-resolve if the
+    // audio is done.  This is the safety net when the callback path is frozen.
+    stopSpeakingWatchdog(); // clear any stale watchdog from a previous cycle
+    _speakingWatchdog = setInterval(async () => {
+      if (!_sound) {
+        // Sound was cleared externally (barge-in / stopVoiceLoop) — resolve now.
+        rlog("TTS", "watchdog: _sound=null → force-resolving playback");
+        stopSpeakingWatchdog();
+        resolvePlayback();
+        return;
+      }
+      try {
+        const st = await _sound.getStatusAsync();
+        if (!st.isLoaded) {
+          rlog("TTS", "watchdog: sound not loaded → force-resolving");
+          stopSpeakingWatchdog();
+          resolvePlayback();
+        } else {
+          const finished =
+            st.didJustFinish ||
+            (!st.isPlaying &&
+              st.positionMillis > 0 &&
+              st.durationMillis !== undefined &&
+              st.positionMillis >= st.durationMillis - 300);
+          if (finished) {
+            rlog("TTS", `watchdog: sound finished (pos=${st.positionMillis}ms) → force-resolving`);
+            stopSpeakingWatchdog();
+            resolvePlayback();
+          }
+        }
+      } catch {
+        rlog("TTS", "watchdog: getStatusAsync threw → force-resolving");
+        stopSpeakingWatchdog();
+        resolvePlayback();
+      }
+    }, 2500);
+
     const safety = new Promise<void>((res) => setTimeout(res, 45_000));
     await Promise.race([done, safety]);
 
+    stopSpeakingWatchdog(); // always clean up after playback resolves
     _playbackResolve = null;
     try { await sound.stopAsync();   } catch {}
     try { await sound.unloadAsync(); } catch {}
     _sound = null;
     rlog("TTS", "playResponseAudio() ✓ done");
   } finally {
+    stopSpeakingWatchdog();
     try { await FileSystem.deleteAsync(tmpPath, { idempotent: true }); } catch {}
   }
 }
@@ -541,7 +598,8 @@ async function startListening(isFollowUp = false): Promise<void> {
   } catch (err) {
     _startListeningInFlight = false; // mutex released on error path
     if (_inFlightMutexTimer) { clearTimeout(_inFlightMutexTimer); _inFlightMutexTimer = null; }
-    stopCpuKeepAlive();              // release keep-alive; re-acquired on retry
+    // NOTE: do NOT stop _cpuKeepAlive here — it must stay alive for the whole
+    // session (mic retry, API call, TTS, etc.).  Only stopVoiceLoop() stops it.
     const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
     _micRetryCount += 1;
     rerror("MIC", `startListening CATCH — attempt ${_micRetryCount}/${MAX_MIC_RETRIES}: ${msg}`);
@@ -821,6 +879,10 @@ export async function startVoiceLoop(): Promise<void> {
   stopIdleWatchdog(); // disarm watchdog — session is now live
   _isActive = true;
   _micRetryCount = 0;
+  // FIX 2 — WakeLock: start keep-alive NOW (not later in startListening) so the
+  // CPU keep-alive covers the greeting TTS, every API round-trip, every TTS, and
+  // every mic-open/retry — the full session from start to stopVoiceLoop().
+  startCpuKeepAlive();
   try {
     const stored = await AsyncStorage.getItem(CONTEXT_SUMMARY_KEY);
     if (stored) _contextSummary = stored;
@@ -847,7 +909,8 @@ export async function stopVoiceLoop(): Promise<void> {
   if (!_isActive) { rlog("LOOP", "stopVoiceLoop() ignored — already inactive"); return; }
   _isActive = false;
   _startListeningInFlight = false; // cancel any in-flight mic open
-  stopCpuKeepAlive();              // release JS-level CPU keep-alive
+  stopCpuKeepAlive();              // FIX 2: stop the session-wide keep-alive
+  stopSpeakingWatchdog();          // FIX 3: clear TTS watchdog if session stops mid-TTS
   DeviceEventEmitter.emit(VL_SESSION, { active: false });
 
   clearMaxTimer();
