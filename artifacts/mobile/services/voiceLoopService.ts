@@ -301,18 +301,18 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
     _sound = null;
   }
 
-  // FIX: use shouldDuckAndroid:FALSE so Android grants AUDIOFOCUS_GAIN (full
-  // audio focus).  shouldDuckAndroid:true only requests AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
-  // which in MODE_IN_COMMUNICATION (set by BT SCO) is NOT routed to the BT
-  // speaker or the phone speaker reliably — causing complete TTS silence.
-  rlog("TTS", "playResponseAudio() — setAudioModeAsync for playback (shouldDuck=false)");
+  // shouldDuckAndroid:false → AUDIOFOCUS_GAIN (full priority — required in
+  // MODE_IN_COMMUNICATION / BT SCO, duck gives TRANSIENT_MAY_DUCK which is silent).
+  // playThroughEarpieceAndroid:true → keeps speakerphone OFF so Android routes
+  // TTS through BT SCO (USAGE_VOICE_COMMUNICATION path) instead of the loudspeaker.
+  rlog("TTS", "playResponseAudio() — setAudioModeAsync for playback (shouldDuck=false, earpiece=true)");
   await Audio.setAudioModeAsync({
     allowsRecordingIOS: false,
     playsInSilentModeIOS: true,
     staysActiveInBackground: true,
     ...(Platform.OS === "android" ? {
       shouldDuckAndroid: false,
-      playThroughEarpieceAndroid: false,
+      playThroughEarpieceAndroid: true,
     } : {}),
   });
 
@@ -610,9 +610,9 @@ async function sendCurrentRecording(): Promise<void> {
     await purgeOldMessages();
     const [settings, history, userProfile] = await Promise.all([
       getSettings(),
-      // Thin client: send only the last 3 exchanges (6 messages) to keep the
+      // Thin client: send only the last 2 exchanges (4 messages) to keep the
       // payload minimal and the round-trip fast.
-      getMessages(6),
+      getMessages(4),
       getUserProfile(),
     ]);
     const contextText  = RollingBufferManager.getContextText();
@@ -633,7 +633,7 @@ async function sendCurrentRecording(): Promise<void> {
         audio: base64Audio,
         voice: settings.voice,
         language: settings.language,
-        history: payload.slice(-6), // thin client: last 3 exchanges
+        history: payload.slice(-4), // thin client: last 2 exchanges
         contextSummary: _contextSummary || undefined,
         userProfile,
       }),
@@ -726,10 +726,17 @@ async function sendCurrentRecording(): Promise<void> {
     const isAbort = err instanceof Error && err.name === "AbortError";
 
     if (isAbort) {
-      // Session was stopped by the user — clean shutdown, no restart.
-      rlog("API", "fetch aborted (session stopped by user)");
       setStatus("idle");
       await audioFlush();
+      if (_isActive) {
+        // Barge-in during "processing": _bargeinFlag was set + fetch aborted,
+        // but session is still live → restart mic immediately so the user can speak.
+        rlog("API", "fetch aborted — barge-in during processing, restarting mic");
+        _bargeinFlag = false;
+        void startListening(true);
+      } else {
+        rlog("API", "fetch aborted — session stopped by user");
+      }
       return;
     }
 
