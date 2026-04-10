@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from "express";
+import OpenAI from "openai";
 import {
   openai,
   speechToText,
@@ -6,6 +7,18 @@ import {
   compressContext,
   type ConversationHistoryEntry,
 } from "@workspace/integrations-openai-ai-server/audio";
+
+// Direct OpenAI client for TTS — the Replit AI proxy does not support POST /audio/speech
+// Lazy-initialized so the server starts even if OPENAI_API_KEY is not configured yet
+let _ttsOpenai: OpenAI | null = null;
+function getTtsClient(): OpenAI {
+  if (!_ttsOpenai) {
+    const key = process.env.OPENAI_API_KEY;
+    if (!key) throw new Error("OPENAI_API_KEY is not set. Please add it as a secret.");
+    _ttsOpenai = new OpenAI({ apiKey: key });
+  }
+  return _ttsOpenai;
+}
 
 const router = Router();
 
@@ -87,7 +100,7 @@ async function generateTextResponse(
  * Synthesise speech for the full assistant response using tts-1.
  */
 async function ttsForText(text: string, voice: VoiceParam): Promise<Buffer> {
-  const resp = await openai.audio.speech.create({
+  const resp = await getTtsClient().audio.speech.create({
     model: "tts-1",
     voice,
     input: text,
