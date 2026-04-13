@@ -40,6 +40,8 @@ import { startSco, waitForScoConnected, stopSco } from "@/services/bluetoothScoS
 import {
   getUserProfile,
   applyProfileUpdates,
+  getLongTermMemory,
+  refreshLongTermMemory,
   type ProfileUpdate,
 } from "@/services/userProfileService";
 
@@ -115,6 +117,10 @@ let _micRetryCount = 0;
 let _playbackResolve: (() => void) | null = null;
 let _bargeinFlag = false; // set by interruptSpeaking() to abort sentence playback loop
 let _contextSummary = "";
+// Counter of successful conversation turns in this session.
+// The biographer (long-term memory updater) fires every BIOGRAPHER_INTERVAL turns.
+let _turnsSinceBiographer = 0;
+const BIOGRAPHER_INTERVAL = 5; // update narrative bio every 5 turns
 // Pre-warmed base64 audio of the error message "Hubo un error de conexión…"
 // Fetched once on startup; played locally on API errors — no network needed.
 let _errorAudioCache: string | null = null;
@@ -666,12 +672,13 @@ async function sendCurrentRecording(): Promise<void> {
       : "http://localhost:8080/api/voice/chat";
 
     await purgeOldMessages();
-    const [settings, history, userProfile] = await Promise.all([
+    const [settings, history, userProfile, longTermMemory] = await Promise.all([
       getSettings(),
       // Thin client: send only the last 2 exchanges (4 messages) to keep the
       // payload minimal and the round-trip fast.
       getMessages(4),
       getUserProfile(),
+      getLongTermMemory(),
     ]);
     const contextText  = RollingBufferManager.getContextText();
 
@@ -681,7 +688,7 @@ async function sendCurrentRecording(): Promise<void> {
       if (!m.text.startsWith("[contexto]")) payload.push({ role: m.role, text: m.text });
     }
 
-    rlog("API", `fetch POST ${apiUrl} — history=${payload.length} msgs profile=${userProfile.name ?? "(anon)"}`);
+    rlog("API", `fetch POST ${apiUrl} — history=${payload.length} msgs profile=${userProfile.name ?? "(anon)"} memory=${longTermMemory.length}ch`);
     _bargeinFlag = false;
     _abortCtrl = new AbortController();
     const response = await fetch(apiUrl, {
@@ -694,6 +701,7 @@ async function sendCurrentRecording(): Promise<void> {
         history: payload.slice(-4), // thin client: last 2 exchanges
         contextSummary: _contextSummary || undefined,
         userProfile,
+        longTermMemory: longTermMemory || undefined, // narrative bio → system prompt
       }),
       signal: _abortCtrl.signal,
     });
@@ -754,6 +762,26 @@ async function sendCurrentRecording(): Promise<void> {
       void addMessage(um);
       void addMessage(am);
       DeviceEventEmitter.emit(VL_MESSAGES, { append: [um, am] });
+    }
+
+    // ── Biographer: update long-term memory every BIOGRAPHER_INTERVAL turns ──
+    // Runs fully in the background (fire-and-forget) so it never blocks TTS.
+    // Uses the last 20 messages for a richer conversational context.
+    _turnsSinceBiographer += 1;
+    if (_turnsSinceBiographer >= BIOGRAPHER_INTERVAL) {
+      _turnsSinceBiographer = 0;
+      const domain = process.env.EXPO_PUBLIC_DOMAIN;
+      const apiBase = domain ? `https://${domain}` : "http://localhost:8080";
+      void (async () => {
+        try {
+          const [recentHistory, currentMemory] = await Promise.all([
+            getMessages(20),
+            getLongTermMemory(),
+          ]);
+          const historyForBiographer = recentHistory.map((m) => ({ role: m.role, text: m.text }));
+          await refreshLongTermMemory(historyForBiographer, currentMemory, apiBase);
+        } catch {}
+      })();
     }
 
     // FIX 3 (barge-in): check the flag BEFORE playing — user may have pressed

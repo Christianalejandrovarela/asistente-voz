@@ -27,9 +27,14 @@ export interface ProfileUpdate {
   value: string;
 }
 
-// ─── Storage key ─────────────────────────────────────────────────────────────
+// ─── Storage keys ─────────────────────────────────────────────────────────────
 
-const PROFILE_KEY = "@user_profile_v1";
+const PROFILE_KEY          = "@user_profile_v1";
+const LONG_TERM_MEMORY_KEY = "@long_term_memory_v1"; // free-text narrative bio
+
+// ─── In-memory cache for long-term memory ─────────────────────────────────────
+
+let _memoryCache: string | null = null;
 
 const DEFAULT_PROFILE: UserProfile = {
   interests: [],
@@ -147,4 +152,73 @@ export function formatProfileForPrompt(profile: UserProfile): string {
   if (profile.facts.length)
     lines.push(`Información adicional:\n${profile.facts.slice(-15).map(f => `- ${f}`).join("\n")}`);
   return lines.join("\n");
+}
+
+// ─── Long-term memory (narrative bio) ────────────────────────────────────────
+
+/**
+ * Read the free-text narrative bio from AsyncStorage.
+ * Returns an empty string if no bio has been generated yet.
+ */
+export async function getLongTermMemory(): Promise<string> {
+  if (_memoryCache !== null) return _memoryCache;
+  try {
+    const stored = await AsyncStorage.getItem(LONG_TERM_MEMORY_KEY);
+    _memoryCache = stored ?? "";
+    if (_memoryCache) rlog("MEMORY", `loaded — ${_memoryCache.length} chars`);
+    return _memoryCache;
+  } catch (e) {
+    rwarn("MEMORY", `getLongTermMemory failed: ${e instanceof Error ? e.message : String(e)}`);
+    _memoryCache = "";
+    return "";
+  }
+}
+
+/**
+ * Overwrite the narrative bio in AsyncStorage and update the in-memory cache.
+ * Called after the biographer API returns an updated profile text.
+ */
+export async function saveLongTermMemory(text: string): Promise<void> {
+  const trimmed = text.trim();
+  _memoryCache = trimmed;
+  try {
+    await AsyncStorage.setItem(LONG_TERM_MEMORY_KEY, trimmed);
+    rlog("MEMORY", `saved — ${trimmed.length} chars`);
+  } catch (e) {
+    rwarn("MEMORY", `saveLongTermMemory failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
+ * Fire-and-forget: call the biographer API and overwrite longTermMemory.
+ * Safe to call without awaiting — never throws or crashes the loop.
+ *
+ * @param history     Recent conversation (up to 20 messages)
+ * @param currentMemory  The existing narrative bio (may be empty)
+ * @param apiBase     Base URL of the API server
+ */
+export async function refreshLongTermMemory(
+  history: { role: string; text: string }[],
+  currentMemory: string,
+  apiBase: string,
+): Promise<void> {
+  rlog("MEMORY", `biographer call — history=${history.length} msgs currentLen=${currentMemory.length}`);
+  try {
+    const resp = await fetch(`${apiBase}/api/voice/biographer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ history, longTermMemory: currentMemory }),
+    });
+    if (!resp.ok) {
+      rwarn("MEMORY", `biographer HTTP ${resp.status}`);
+      return;
+    }
+    const data = await resp.json() as { longTermMemory?: string };
+    if (typeof data.longTermMemory === "string" && data.longTermMemory.trim().length > 0) {
+      await saveLongTermMemory(data.longTermMemory);
+      rlog("MEMORY", `biographer ✓ — new profile: ${data.longTermMemory.slice(0, 80)}…`);
+    }
+  } catch (e) {
+    rwarn("MEMORY", `refreshLongTermMemory failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
