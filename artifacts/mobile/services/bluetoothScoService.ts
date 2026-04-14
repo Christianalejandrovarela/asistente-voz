@@ -40,6 +40,24 @@ export async function stopSco(): Promise<void> {
 }
 
 /**
+ * Re-assert MODE_IN_COMMUNICATION + isBluetoothScoOn=true without
+ * re-registering the BroadcastReceiver or waiting for BTScoConnected.
+ *
+ * Call this immediately before every Recording.createAsync() so the mic
+ * stays on the BT headset even after expo-av's setAudioModeAsync(MODE_NORMAL)
+ * calls (which happen during TTS and audioFlush between turns).
+ */
+export async function reapplyBtSco(): Promise<void> {
+  if (Platform.OS !== "android" || !BluetoothScoModule) return;
+  try {
+    await BluetoothScoModule.reapplyBtSco();
+    rlog("SCO", "reapplyBtSco() → MODE_IN_COMMUNICATION + isBluetoothScoOn=true ✓");
+  } catch (e) {
+    rwarn("SCO", `reapplyBtSco() threw: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
  * Wait for the BT headset to fully connect SCO audio.
  * Resolves true  → SCO connected (mic will use BT headset).
  * Resolves false → timeout or no emitter (phone mic fallback).

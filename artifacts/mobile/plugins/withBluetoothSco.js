@@ -117,6 +117,28 @@ class BluetoothScoModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    /**
+     * Re-assert BT SCO mic routing without re-registering the BroadcastReceiver.
+     * Called immediately before every Recording.createAsync() so that expo-av's
+     * prior setAudioModeAsync(MODE_NORMAL) call cannot silently steal the mic
+     * back to the phone's internal hardware.
+     *
+     * SCO is already connected at the hardware level (startSco() ran at session
+     * start and stopSco() was never called), so this is instant — no need to
+     * wait for BTScoConnected again.
+     */
+    @ReactMethod
+    fun reapplyBtSco(promise: Promise) {
+        try {
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            @Suppress("DEPRECATION")
+            audioManager.isBluetoothScoOn = true
+            promise.resolve(null)
+        } catch (e: Exception) {
+            promise.reject("SCO_REAPPLY_ERR", e.message, e)
+        }
+    }
+
     // Required for NativeEventEmitter on React Native's new bridge.
     @ReactMethod fun addListener(eventName: String) {}
     @ReactMethod fun removeListeners(count: Int) {}

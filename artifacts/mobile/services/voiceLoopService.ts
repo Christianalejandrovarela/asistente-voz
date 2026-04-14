@@ -36,7 +36,7 @@ import {
 import { pauseSilentTrack, resumeSilentTrack } from "@/services/trackPlayer";
 import { RollingBufferManager } from "@/services/rollingBufferManager";
 import { rlog, rwarn, rerror } from "@/services/remoteLogger";
-import { startSco, waitForScoConnected, stopSco } from "@/services/bluetoothScoService";
+import { startSco, waitForScoConnected, stopSco, reapplyBtSco } from "@/services/bluetoothScoService";
 import {
   getUserProfile,
   applyProfileUpdates,
@@ -491,17 +491,35 @@ async function startListening(isFollowUp = false): Promise<void> {
     }
     await stopCurrentRecording();
 
-    rlog("MIC", "setAudioModeAsync for recording...");
+    // ── Audio mode for recording ──────────────────────────────────────────────
+    // playThroughEarpieceAndroid: TRUE  →  expo-av sets MODE_IN_COMMUNICATION
+    //   which is required for Android to route the microphone through the BT
+    //   headset (SCO). Setting this to FALSE would put the mode back to
+    //   MODE_NORMAL (STREAM_MUSIC) and Android would silently fall back to
+    //   the phone's internal microphone, ignoring the BT headset entirely.
+    // Note: TTS playback uses earpiece=false (MODE_NORMAL → A2DP) in both
+    //   playResponseAudio() and audioFlush() — that switch is intentional and
+    //   only affects the playback phase, not this recording phase.
+    rlog("MIC", "setAudioModeAsync for recording (earpiece=true → MODE_IN_COMMUNICATION)...");
     await Audio.setAudioModeAsync({
       allowsRecordingIOS: true,
       playsInSilentModeIOS: true,
       ...(Platform.OS === "android" ? {
         staysActiveInBackground: true,
         shouldDuckAndroid: false,
-        playThroughEarpieceAndroid: false,
+        playThroughEarpieceAndroid: true,   // ← keeps MODE_IN_COMMUNICATION for BT SCO mic
       } : {}),
     });
     rlog("MIC", "setAudioModeAsync ✓");
+
+    // ── Guarantee BT SCO mic routing ──────────────────────────────────────────
+    // expo-av's setAudioModeAsync above sets the mode at Java layer, but does
+    // NOT re-set isBluetoothScoOn. Between turns, audioFlush() and TTS calls
+    // may have set MODE_NORMAL which cleared that flag.  reapplyBtSco() forces
+    // MODE_IN_COMMUNICATION + isBluetoothScoOn=true at the native AudioManager
+    // level, ensuring the hardware mic is the BT headset for this recording.
+    await reapplyBtSco();
+    rlog("MIC", "reapplyBtSco() ✓ — BT mic locked before Recording.createAsync()");
 
     rlog("MIC", "Audio.Recording.createAsync() — opening hardware mic...");
     const { recording } = await Audio.Recording.createAsync(
