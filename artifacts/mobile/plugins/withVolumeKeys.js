@@ -127,9 +127,12 @@ function patchMainActivity(src) {
   }
 
   // Inject dispatchKeyEvent override before the very last closing brace of the file.
+  // NOTE: ReactActivity extends AppCompatActivity whose dispatchKeyEvent signature
+  // is NON-NULLABLE (fun dispatchKeyEvent(event: KeyEvent): Boolean).
+  // Using KeyEvent? (nullable) causes a compile error: "overrides nothing".
   const override = `
-    override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
-        if (event != null && event.action == KeyEvent.ACTION_DOWN) {
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) {
             val kc = event.keyCode
             if (kc == KeyEvent.KEYCODE_VOLUME_UP || kc == KeyEvent.KEYCODE_VOLUME_DOWN) {
                 VolumeKeyModule.notifyVolumeKey()
