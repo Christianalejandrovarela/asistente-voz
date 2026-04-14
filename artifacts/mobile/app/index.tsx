@@ -1,4 +1,4 @@
-import React, { useCallback, useRef } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   FlatList,
   Platform,
@@ -6,6 +6,7 @@ import {
   StatusBar,
   StyleSheet,
   Text,
+  TouchableWithoutFeedback,
   View,
 } from "react-native";
 import { Feather } from "@expo/vector-icons";
@@ -25,11 +26,38 @@ const STATUS_LABELS: Record<AssistantStatus, string> = {
   speaking: "Respondiendo...",
 };
 
+// How long without a touch before the AMOLED black overlay appears (ms).
+const AMOLED_TIMEOUT_MS = 20_000;
+
 export default function MainScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
   const { status, isSessionActive, messages, isBluetoothActive, debugInfo, startSession, stopSession, interruptSpeaking } = useAssistant();
   const listRef = useRef<FlatList>(null);
+
+  // ── AMOLED "Modo Bolsillo" overlay ─────────────────────────────────────────
+  // After AMOLED_TIMEOUT_MS of no touch, a full-screen black View covers the UI.
+  // AMOLED panels use ~0 power for pure black pixels, so this saves battery while
+  // keeping the screen physically on (useKeepAwake in _layout prevents OS timeout).
+  // Touching anywhere dismisses the overlay and resets the inactivity timer.
+  const [amoledActive, setAmoledActive] = useState(false);
+  const inactivityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const resetInactivityTimer = useCallback(() => {
+    if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
+    setAmoledActive(false);
+    inactivityTimer.current = setTimeout(() => {
+      setAmoledActive(true);
+    }, AMOLED_TIMEOUT_MS);
+  }, []);
+
+  // Start timer on mount, clear on unmount.
+  useEffect(() => {
+    resetInactivityTimer();
+    return () => {
+      if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
+    };
+  }, [resetInactivityTimer]);
 
   const handleOrbPress = useCallback(async () => {
     if (!isSessionActive) {
@@ -76,6 +104,7 @@ export default function MainScreen() {
           paddingBottom: insets.bottom + webBotPad,
         },
       ]}
+      onTouchStart={resetInactivityTimer}
     >
       <StatusBar barStyle="light-content" backgroundColor={colors.background} />
 
@@ -150,6 +179,30 @@ export default function MainScreen() {
         <View style={styles.debugBar}>
           <Text style={styles.debugText}>{debugInfo}</Text>
         </View>
+      )}
+
+      {/* ── AMOLED "Modo Bolsillo" overlay ──────────────────────────────────
+          Full-screen pure-black View that appears after 20 s of inactivity.
+          AMOLED pixels emit zero light at #000000 → near-zero battery draw.
+          The screen stays physically ON (useKeepAwake) so the OS never kills
+          the JS thread — the voice loop keeps running underneath.
+          Tap anywhere to dismiss and see the UI again.
+      ─────────────────────────────────────────────────────────────────────── */}
+      {amoledActive && Platform.OS !== "web" && (
+        <TouchableWithoutFeedback onPress={resetInactivityTimer}>
+          <View style={styles.amoledOverlay}>
+            <StatusBar hidden />
+            {isSessionActive && (
+              <View style={styles.amoledPill}>
+                <View style={[styles.amoledDot, { backgroundColor: status === "speaking" ? "#4f6ef7" : status === "recording" ? "#22c55e" : "#666" }]} />
+                <Text style={styles.amoledLabel}>
+                  {status === "speaking" ? "Respondiendo" : status === "recording" ? "Escuchando" : status === "processing" ? "Pensando" : "En espera"}
+                </Text>
+              </View>
+            )}
+            <Text style={styles.amoledHint}>Toca para ver</Text>
+          </View>
+        </TouchableWithoutFeedback>
       )}
     </View>
   );
@@ -254,5 +307,44 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontFamily: "Inter_400Regular",
     textAlign: "center",
+  },
+  // ── AMOLED overlay styles ──────────────────────────────────────────────────
+  amoledOverlay: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: "#000000",
+    zIndex: 999,
+    alignItems: "center",
+    justifyContent: "flex-end",
+    paddingBottom: 48,
+  },
+  amoledPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.08)",
+  },
+  amoledDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+  },
+  amoledLabel: {
+    color: "rgba(255,255,255,0.35)",
+    fontSize: 13,
+    fontFamily: "Inter_500Medium",
+  },
+  amoledHint: {
+    color: "rgba(255,255,255,0.15)",
+    fontSize: 12,
+    fontFamily: "Inter_400Regular",
   },
 });

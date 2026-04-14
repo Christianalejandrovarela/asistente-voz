@@ -8,6 +8,7 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Stack } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
+import { useKeepAwake } from "expo-keep-awake";
 import React, { useEffect } from "react";
 import { View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
@@ -38,6 +39,11 @@ function RootLayoutNav() {
 }
 
 export default function RootLayout() {
+  // Keep the screen permanently awake for the entire app lifetime.
+  // This prevents Android's screen timeout from killing the JS thread,
+  // which would pause the voice loop when the phone is left on a table.
+  useKeepAwake();
+
   const [fontsLoaded, fontError] = useFonts({
     Inter_400Regular,
     Inter_500Medium,
