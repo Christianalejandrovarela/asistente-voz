@@ -62,7 +62,8 @@
         }
       ],
       "./plugins/withReactNativeTrackPlayer",
-      "./plugins/withBluetoothSco"
+      "./plugins/withBluetoothSco",
+      "./plugins/withVolumeKeys"
     ],
     "experiments": {
       "typedRoutes": true,

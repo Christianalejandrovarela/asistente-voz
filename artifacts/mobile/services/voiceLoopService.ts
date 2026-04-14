@@ -75,6 +75,16 @@ const VAD_SILENCE_DB      = -45;
 const VAD_SILENCE_MS      = 1500;
 const VAD_MIN_SPEECH_MS   = 300;
 const MAX_RECORDING_MS    = 60_000;
+
+// Shadow VAD ("Gochi" barge-in during TTS)
+// Any speech louder than SHADOW_VAD_DB sustained for SHADOW_VAD_MS triggers
+// an immediate barge-in — the user says "Gochi" (or any word) to interrupt.
+// The threshold is deliberately high (-28 dB) to avoid picking up TTS echo
+// from the phone speaker when no BT headset is connected.
+// When BT is connected, TTS goes through the earphone (A2DP) — the internal
+// mic won't pick it up, so even -36 dB would be safe; we stay conservative.
+const SHADOW_VAD_DB  = -28;
+const SHADOW_VAD_MS  = 350;
 // Extended from 7 s → 15 s: with screen off the user needs more time to
 // react after the "Dime, te escucho" greeting before the follow-up window closes.
 const FOLLOW_UP_MS        = 15_000;
@@ -340,6 +350,9 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
   // Fixed filename — overwritten each turn so no orphaned files accumulate
   // in the cache dir even if a previous error skipped the finally block.
   const tmpPath = `${FileSystem.cacheDirectory ?? ""}ai_tts_response.mp3`;
+  // Shadow VAD state — declared outside the try so the finally block can reach them.
+  let shadowRec: Audio.Recording | null = null;
+  let shadowSpeechStart: number | null = null;
   try {
     await FileSystem.writeAsStringAsync(tmpPath, base64Audio, { encoding: "base64" });
     rlog("TTS", "playResponseAudio() — Audio.Sound.createAsync start");
@@ -368,6 +381,48 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
     );
     _sound = sound;
     rlog("TTS", "playResponseAudio() — sound playing, waiting for finish...");
+
+    // ── Shadow VAD: "Gochi" / barge-in by voice ───────────────────────────────
+    // Opens a low-priority background recording on the internal mic while the
+    // TTS is playing through the BT earphone (A2DP).  Monitors the VU meter:
+    // if speech exceeds SHADOW_VAD_DB for SHADOW_VAD_MS, the TTS is interrupted
+    // immediately and the loop opens the microphone for the user's next command.
+    //
+    // WHY internal mic?  TTS plays in MODE_NORMAL (A2DP).  Re-activating SCO
+    // (MODE_IN_COMMUNICATION) here would break the A2DP audio stream.  Using the
+    // internal mic for wake-word detection is acceptable — the user just needs to
+    // speak loud enough to exceed the threshold.
+    //
+    // Graceful fallback: if Recording.createAsync() fails (audio focus conflict,
+    // hardware limitation, etc.) the TTS continues normally — shadow VAD is
+    // best-effort.
+    try {
+      const { recording: sr } = await Audio.Recording.createAsync(
+        { ...Audio.RecordingOptionsPresets.LOW_QUALITY, isMeteringEnabled: true },
+        undefined,
+        100
+      );
+      shadowRec = sr;
+      sr.setOnRecordingStatusUpdate((s) => {
+        if (!s.isRecording || _bargeinFlag) return;
+        const db = s.metering ?? -160;
+        if (db > SHADOW_VAD_DB) {
+          if (!shadowSpeechStart) {
+            shadowSpeechStart = Date.now();
+          } else if (Date.now() - shadowSpeechStart >= SHADOW_VAD_MS) {
+            rlog("GOCHI", `voice barge-in detected (db=${db.toFixed(1)}, dur=${Date.now() - shadowSpeechStart}ms) → interrupting TTS`);
+            _bargeinFlag = true;
+            shadowSpeechStart = null;
+            resolvePlayback();
+          }
+        } else {
+          shadowSpeechStart = null;
+        }
+      });
+      rlog("GOCHI", "shadow VAD active (internal mic, threshold=" + SHADOW_VAD_DB + "dB)");
+    } catch (e) {
+      rlog("GOCHI", `shadow VAD skipped (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+    }
 
     // FIX 3 — Speaking watchdog (anti-freeze on screen-off):
     // onPlaybackStatusUpdate callbacks stop firing when the screen is off on
@@ -420,6 +475,13 @@ async function playResponseAudio(base64Audio: string): Promise<void> {
     rlog("TTS", "playResponseAudio() ✓ done");
   } finally {
     stopSpeakingWatchdog();
+    // Always stop the shadow VAD recording — whether TTS finished normally,
+    // was interrupted by barge-in, or the function threw unexpectedly.
+    if (shadowRec) {
+      try { shadowRec.setOnRecordingStatusUpdate(null); } catch {}
+      try { await shadowRec.stopAndUnloadAsync(); } catch {}
+      shadowRec = null;
+    }
     try { await FileSystem.deleteAsync(tmpPath, { idempotent: true }); } catch {}
   }
 }

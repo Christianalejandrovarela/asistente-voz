@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   FlatList,
+  NativeEventEmitter,
+  NativeModules,
   Platform,
   Pressable,
   StatusBar,
@@ -17,6 +19,13 @@ import { VoiceOrb } from "@/components/VoiceOrb";
 import { MessageBubble } from "@/components/MessageBubble";
 import { AssistantStatus, ChatMessage, useAssistant } from "@/context/AssistantContext";
 import { useColors } from "@/hooks/useColors";
+
+// Native volume-key emitter — only available on Android (native build).
+// Falls back to null on web / iOS so the rest of the code is always safe.
+const volumeKeyEmitter =
+  Platform.OS === "android" && NativeModules.VolumeKeyModule
+    ? new NativeEventEmitter(NativeModules.VolumeKeyModule)
+    : null;
 
 const STATUS_LABELS: Record<AssistantStatus, string> = {
   idle: "Listo",
@@ -57,6 +66,21 @@ export default function MainScreen() {
     return () => {
       if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
     };
+  }, [resetInactivityTimer]);
+
+  // ── Volume keys → dismiss AMOLED overlay ────────────────────────────────────
+  // When the AMOLED black overlay is active, pressing VOLUME_UP or VOLUME_DOWN
+  // dismisses it and restores the normal UI.  The system still handles the
+  // actual volume change (we don't consume the key event natively).
+  // Uses the VolumeKeyModule native Kotlin module injected via withVolumeKeys.js.
+  useEffect(() => {
+    if (!volumeKeyEmitter) return;
+    const sub = volumeKeyEmitter.addListener("VolumeKeyPressed", () => {
+      // Dismiss overlay and reset inactivity timer — amoledActive check is
+      // implicit: resetInactivityTimer() always sets amoledActive = false.
+      resetInactivityTimer();
+    });
+    return () => sub.remove();
   }, [resetInactivityTimer]);
 
   const handleOrbPress = useCallback(async () => {

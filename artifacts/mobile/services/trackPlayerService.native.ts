@@ -1,5 +1,5 @@
 import TrackPlayer, { Event } from "react-native-track-player";
-import { toggleVoiceLoop } from "./voiceLoopService";
+import { toggleVoiceLoop, interruptSpeaking, getVoiceLoopSnapshot } from "./voiceLoopService";
 import { rlog, rwarn } from "./remoteLogger";
 
 /**
@@ -120,7 +120,22 @@ async function handleToggleEvent(label: string): Promise<void> {
     return;
   }
   _lastToggleMs = now;
-  rlog("BT", `${label} ACCEPTED — delta=${delta}ms, calling toggleVoiceLoop()`);
+
+  const { status } = getVoiceLoopSnapshot();
+
+  // ── BARGE-IN path: AI is speaking ───────────────────────────────────────────
+  // Skip the beep entirely so the TTS stops as fast as possible.
+  // interruptSpeaking() resolves the internal playback Promise immediately;
+  // the loop transitions to "recording" on its own without any extra work.
+  if (status === "speaking" || status === "processing") {
+    rlog("BT", `${label} BARGE-IN — status=${status}, calling interruptSpeaking() immediately (no beep)`);
+    console.log(`[PlaybackService] ${label} → barge-in (no beep)`);
+    interruptSpeaking();
+    return;
+  }
+
+  // ── Normal path: start / stop session ────────────────────────────────────────
+  rlog("BT", `${label} ACCEPTED — delta=${delta}ms status=${status}, calling toggleVoiceLoop()`);
   console.log(`[PlaybackService] ${label} accepted`);
   await playConfirmationBeep();
   toggleVoiceLoop();
