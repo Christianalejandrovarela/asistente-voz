@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   FlatList,
+  Modal,
   NativeEventEmitter,
   NativeModules,
   Platform,
@@ -14,6 +15,7 @@ import {
 import { Feather } from "@expo/vector-icons";
 import { router } from "expo-router";
 import * as Haptics from "expo-haptics";
+import * as NavigationBar from "expo-navigation-bar";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { VoiceOrb } from "@/components/VoiceOrb";
 import { MessageBubble } from "@/components/MessageBubble";
@@ -82,6 +84,25 @@ export default function MainScreen() {
     });
     return () => sub.remove();
   }, [resetInactivityTimer]);
+
+  // ── Navigation bar + status bar: hide entirely in Modo Bolsillo ─────────────
+  // AMOLED pixels: pure #000000 = 0 W emission.  Any lit pixel (white nav bar,
+  // status icons, UI text) wastes power.  We use React Native's Modal with
+  // statusBarTranslucent to cover the status bar area, and expo-navigation-bar
+  // to hide the Android system nav bar entirely.
+  // Restoration runs synchronously when the overlay dismisses so the user can
+  // navigate normally immediately after.
+  useEffect(() => {
+    if (Platform.OS !== "android") return;
+    if (amoledActive) {
+      // Full immersive: hide the system nav bar (bottom edge).
+      // "overlay-swipe" = one swipe from bottom edge re-shows it momentarily.
+      void NavigationBar.setVisibilityAsync("hidden");
+      void NavigationBar.setBehaviorAsync("overlay-swipe");
+    } else {
+      void NavigationBar.setVisibilityAsync("visible");
+    }
+  }, [amoledActive]);
 
   const handleOrbPress = useCallback(async () => {
     if (!isSessionActive) {
@@ -206,28 +227,30 @@ export default function MainScreen() {
       )}
 
       {/* ── AMOLED "Modo Bolsillo" overlay ──────────────────────────────────
-          Full-screen pure-black View that appears after 20 s of inactivity.
-          AMOLED pixels emit zero light at #000000 → near-zero battery draw.
-          The screen stays physically ON (useKeepAwake) so the OS never kills
-          the JS thread — the voice loop keeps running underneath.
-          Tap anywhere to dismiss and see the UI again.
+          A React Native Modal with statusBarTranslucent={true} draws from
+          pixel (0,0) of the physical screen, overriding both the status bar
+          area and the safe area insets — nothing is clipped.
+          backgroundColor: '#000000' = AMOLED pixels off = ~0 W.
+          NO text, NO icons, NO status indicators inside: any lit pixel costs
+          battery. Pure black silence.
+          The navigation bar is hidden separately via expo-navigation-bar
+          (see useEffect above).  It's restored when the overlay dismisses.
+          Tap anywhere (or press a volume key) to exit.
       ─────────────────────────────────────────────────────────────────────── */}
-      {amoledActive && Platform.OS !== "web" && (
+      <Modal
+        visible={amoledActive && Platform.OS !== "web"}
+        transparent
+        statusBarTranslucent
+        animationType="none"
+        onRequestClose={resetInactivityTimer}
+      >
+        {/* StatusBar hidden=true removes the top status bar icons + background. */}
+        <StatusBar hidden translucent backgroundColor="transparent" />
         <TouchableWithoutFeedback onPress={resetInactivityTimer}>
-          <View style={styles.amoledOverlay}>
-            <StatusBar hidden />
-            {isSessionActive && (
-              <View style={styles.amoledPill}>
-                <View style={[styles.amoledDot, { backgroundColor: status === "speaking" ? "#4f6ef7" : status === "recording" ? "#22c55e" : "#666" }]} />
-                <Text style={styles.amoledLabel}>
-                  {status === "speaking" ? "Respondiendo" : status === "recording" ? "Escuchando" : status === "processing" ? "Pensando" : "En espera"}
-                </Text>
-              </View>
-            )}
-            <Text style={styles.amoledHint}>Toca para ver</Text>
-          </View>
+          {/* flex:1 fills the entire Modal viewport = full physical screen */}
+          <View style={styles.amoledOverlay} />
         </TouchableWithoutFeedback>
-      )}
+      </Modal>
     </View>
   );
 }
@@ -332,43 +355,13 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_400Regular",
     textAlign: "center",
   },
-  // ── AMOLED overlay styles ──────────────────────────────────────────────────
+  // ── AMOLED overlay style ───────────────────────────────────────────────────
+  // flex:1 fills the entire Modal viewport (= full physical screen because
+  // the Modal uses statusBarTranslucent and draws edge-to-edge).
+  // backgroundColor '#000000' = AMOLED pixels completely off.
+  // No content, no text, no indicators: absolute darkness.
   amoledOverlay: {
-    position: "absolute",
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
+    flex: 1,
     backgroundColor: "#000000",
-    zIndex: 999,
-    alignItems: "center",
-    justifyContent: "flex-end",
-    paddingBottom: 48,
-  },
-  amoledPill: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    marginBottom: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.08)",
-  },
-  amoledDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 4,
-  },
-  amoledLabel: {
-    color: "rgba(255,255,255,0.35)",
-    fontSize: 13,
-    fontFamily: "Inter_500Medium",
-  },
-  amoledHint: {
-    color: "rgba(255,255,255,0.15)",
-    fontSize: 12,
-    fontFamily: "Inter_400Regular",
   },
 });
