@@ -24,6 +24,11 @@
         ]
       }
     },
+    "androidStatusBar": {
+      "translucent": true,
+      "backgroundColor": "transparent",
+      "barStyle": "light-content"
+    },
     "android": {
       "package": "com.asistentevoz.ia",
       "permissions": [

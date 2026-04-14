@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   FlatList,
-  Modal,
   NativeEventEmitter,
   NativeModules,
   Platform,
@@ -9,7 +8,6 @@ import {
   StatusBar,
   StyleSheet,
   Text,
-  TouchableWithoutFeedback,
   View,
 } from "react-native";
 import { Feather } from "@expo/vector-icons";
@@ -22,8 +20,7 @@ import { MessageBubble } from "@/components/MessageBubble";
 import { AssistantStatus, ChatMessage, useAssistant } from "@/context/AssistantContext";
 import { useColors } from "@/hooks/useColors";
 
-// Native volume-key emitter — only available on Android (native build).
-// Falls back to null on web / iOS so the rest of the code is always safe.
+// Native volume-key emitter (Android only — native build).
 const volumeKeyEmitter =
   Platform.OS === "android" && NativeModules.VolumeKeyModule
     ? new NativeEventEmitter(NativeModules.VolumeKeyModule)
@@ -37,7 +34,7 @@ const STATUS_LABELS: Record<AssistantStatus, string> = {
   speaking: "Respondiendo...",
 };
 
-// How long without a touch before the AMOLED black overlay appears (ms).
+// Auto-timeout: seconds of inactivity before Modo Bolsillo activates automatically.
 const AMOLED_TIMEOUT_MS = 20_000;
 
 export default function MainScreen() {
@@ -46,57 +43,54 @@ export default function MainScreen() {
   const { status, isSessionActive, messages, isBluetoothActive, debugInfo, startSession, stopSession, interruptSpeaking } = useAssistant();
   const listRef = useRef<FlatList>(null);
 
-  // ── AMOLED "Modo Bolsillo" overlay ─────────────────────────────────────────
-  // After AMOLED_TIMEOUT_MS of no touch, a full-screen black View covers the UI.
-  // AMOLED panels use ~0 power for pure black pixels, so this saves battery while
-  // keeping the screen physically on (useKeepAwake in _layout prevents OS timeout).
-  // Touching anywhere dismisses the overlay and resets the inactivity timer.
+  // ── Modo Bolsillo state ─────────────────────────────────────────────────────
   const [amoledActive, setAmoledActive] = useState(false);
   const inactivityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const resetInactivityTimer = useCallback(() => {
+  // ── ACTIVATE: button press OR auto-timeout ──────────────────────────────────
+  const activatePocketMode = useCallback(() => {
     if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
-    setAmoledActive(false);
-    inactivityTimer.current = setTimeout(() => {
-      setAmoledActive(true);
-    }, AMOLED_TIMEOUT_MS);
+    setAmoledActive(true);
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
   }, []);
 
-  // Start timer on mount, clear on unmount.
+  // ── EXIT: volume button OR 3-second long press (ONLY these two paths) ───────
+  const exitPocketMode = useCallback(() => {
+    setAmoledActive(false);
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    // Restart the auto-timeout after exiting.
+    if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
+    inactivityTimer.current = setTimeout(activatePocketMode, AMOLED_TIMEOUT_MS);
+  }, [activatePocketMode]);
+
+  // Auto-timeout: start on mount, restart whenever the user touches the main UI.
+  const resetAutoTimeout = useCallback(() => {
+    if (amoledActive) return; // Do not reset while in pocket mode.
+    if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
+    inactivityTimer.current = setTimeout(activatePocketMode, AMOLED_TIMEOUT_MS);
+  }, [amoledActive, activatePocketMode]);
+
   useEffect(() => {
-    resetInactivityTimer();
+    resetAutoTimeout();
     return () => {
       if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
     };
-  }, [resetInactivityTimer]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  // ── Volume keys → dismiss AMOLED overlay ────────────────────────────────────
-  // When the AMOLED black overlay is active, pressing VOLUME_UP or VOLUME_DOWN
-  // dismisses it and restores the normal UI.  The system still handles the
-  // actual volume change (we don't consume the key event natively).
-  // Uses the VolumeKeyModule native Kotlin module injected via withVolumeKeys.js.
+  // ── Volume keys → EXIT Modo Bolsillo ────────────────────────────────────────
   useEffect(() => {
     if (!volumeKeyEmitter) return;
-    const sub = volumeKeyEmitter.addListener("VolumeKeyPressed", () => {
-      // Dismiss overlay and reset inactivity timer — amoledActive check is
-      // implicit: resetInactivityTimer() always sets amoledActive = false.
-      resetInactivityTimer();
-    });
+    const sub = volumeKeyEmitter.addListener("VolumeKeyPressed", exitPocketMode);
     return () => sub.remove();
-  }, [resetInactivityTimer]);
+  }, [exitPocketMode]);
 
-  // ── Navigation bar + status bar: hide entirely in Modo Bolsillo ─────────────
-  // AMOLED pixels: pure #000000 = 0 W emission.  Any lit pixel (white nav bar,
-  // status icons, UI text) wastes power.  We use React Native's Modal with
-  // statusBarTranslucent to cover the status bar area, and expo-navigation-bar
-  // to hide the Android system nav bar entirely.
-  // Restoration runs synchronously when the overlay dismisses so the user can
-  // navigate normally immediately after.
+  // ── Navigation bar: hide in Modo Bolsillo, restore on exit ──────────────────
+  // expo-navigation-bar controls the Android system bottom bar.
+  // "overlay-swipe" means a brief swipe shows it momentarily then re-hides.
   useEffect(() => {
     if (Platform.OS !== "android") return;
     if (amoledActive) {
-      // Full immersive: hide the system nav bar (bottom edge).
-      // "overlay-swipe" = one swipe from bottom edge re-shows it momentarily.
       void NavigationBar.setVisibilityAsync("hidden");
       void NavigationBar.setBehaviorAsync("overlay-swipe");
     } else {
@@ -109,7 +103,6 @@ export default function MainScreen() {
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
       await startSession();
     } else if (status === "speaking") {
-      // Interrupt the AI mid-response and start listening immediately
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
       await interruptSpeaking();
     } else {
@@ -127,9 +120,7 @@ export default function MainScreen() {
 
   const reversedMessages = [...messages].reverse();
 
-  const statusLabel = isSessionActive
-    ? STATUS_LABELS[status]
-    : "Toca para comenzar";
+  const statusLabel = isSessionActive ? STATUS_LABELS[status] : "Toca para comenzar";
 
   const hintText = !isSessionActive
     ? " "
@@ -140,122 +131,158 @@ export default function MainScreen() {
     : "Toca para terminar";
 
   return (
-    <View
-      style={[
-        styles.container,
-        {
-          backgroundColor: colors.background,
-          paddingTop: insets.top + webTopPad,
-          paddingBottom: insets.bottom + webBotPad,
-        },
-      ]}
-      onTouchStart={resetInactivityTimer}
-    >
-      <StatusBar barStyle="light-content" backgroundColor={colors.background} />
+    // ── ROOT view: fills the FULL physical screen ─────────────────────────────
+    // With androidStatusBar.translucent=true in app.json, this View starts at
+    // pixel (0,0) of the screen — underneath the status bar.  That means the
+    // absolute-positioned AMOLED overlay below can cover EVERYTHING.
+    <View style={styles.root} onTouchStart={resetAutoTimeout}>
 
-      <View style={styles.header}>
-        <View style={styles.headerLeft}>
-          {isBluetoothActive && (
-            <View style={styles.btBadge}>
-              <Feather name="bluetooth" size={12} color={colors.primary} />
-              <Text style={[styles.btText, { color: colors.primary }]}>BT</Text>
-            </View>
-          )}
-          {isSessionActive && (
-            <View style={[styles.liveBadge, { backgroundColor: "rgba(34, 197, 94, 0.15)" }]}>
-              <View style={styles.liveDot} />
-              <Text style={[styles.liveText, { color: "#22c55e" }]}>EN VIVO</Text>
+      {/* Normal status bar — hidden when Modo Bolsillo is active */}
+      <StatusBar
+        translucent
+        barStyle="light-content"
+        backgroundColor="transparent"
+        hidden={amoledActive}
+      />
+
+      {/* ── Main UI (safe-area insets applied here, not on root) ──────────── */}
+      <View
+        style={[
+          styles.container,
+          {
+            backgroundColor: colors.background,
+            paddingTop: insets.top + webTopPad,
+            paddingBottom: insets.bottom + webBotPad,
+          },
+        ]}
+      >
+        {/* Header */}
+        <View style={styles.header}>
+          <View style={styles.headerLeft}>
+            {isBluetoothActive && (
+              <View style={styles.btBadge}>
+                <Feather name="bluetooth" size={12} color={colors.primary} />
+                <Text style={[styles.btText, { color: colors.primary }]}>BT</Text>
+              </View>
+            )}
+            {isSessionActive && (
+              <View style={[styles.liveBadge, { backgroundColor: "rgba(34, 197, 94, 0.15)" }]}>
+                <View style={styles.liveDot} />
+                <Text style={[styles.liveText, { color: "#22c55e" }]}>EN VIVO</Text>
+              </View>
+            )}
+          </View>
+          <Pressable
+            style={styles.settingsBtn}
+            onPress={() => router.push("/settings")}
+            testID="settings-button"
+          >
+            <Feather name="settings" size={22} color={colors.mutedForeground} />
+          </Pressable>
+        </View>
+
+        {/* Message list */}
+        <View style={styles.listWrapper}>
+          <FlatList
+            ref={listRef}
+            data={reversedMessages}
+            keyExtractor={(item) => item.id}
+            renderItem={renderItem}
+            inverted
+            contentContainerStyle={styles.listContent}
+            showsVerticalScrollIndicator={false}
+            scrollEnabled={!!reversedMessages.length}
+            style={styles.list}
+          />
+          {reversedMessages.length === 0 && (
+            <View style={styles.emptyState} pointerEvents="none">
+              <Feather name="mic" size={28} color={colors.mutedForeground} />
+              <Text style={[styles.emptyText, { color: colors.mutedForeground }]}>
+                Toca el botón para iniciar{"\n"}una conversación
+              </Text>
             </View>
           )}
         </View>
-        <Pressable
-          style={styles.settingsBtn}
-          onPress={() => router.push("/settings")}
-          testID="settings-button"
-        >
-          <Feather name="settings" size={22} color={colors.mutedForeground} />
-        </Pressable>
-      </View>
 
-      <View style={styles.listWrapper}>
-        <FlatList
-          ref={listRef}
-          data={reversedMessages}
-          keyExtractor={(item) => item.id}
-          renderItem={renderItem}
-          inverted
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-          scrollEnabled={!!reversedMessages.length}
-          style={styles.list}
-        />
-        {reversedMessages.length === 0 && (
-          <View style={styles.emptyState} pointerEvents="none">
-            <Feather name="mic" size={28} color={colors.mutedForeground} />
-            <Text style={[styles.emptyText, { color: colors.mutedForeground }]}>
-              Toca el botón para iniciar{"\n"}una conversación
-            </Text>
+        {/* Orb area */}
+        <View style={styles.orbArea}>
+          <Text style={[styles.statusLabel, { color: colors.mutedForeground }]}>
+            {statusLabel}
+          </Text>
+
+          <Pressable
+            onPress={handleOrbPress}
+            style={({ pressed }) => [
+              styles.orbWrapper,
+              pressed && styles.orbPressed,
+            ]}
+            testID="voice-orb"
+          >
+            <VoiceOrb status={isSessionActive ? status : "idle"} size={100} />
+          </Pressable>
+
+          <Text style={[styles.hintText, { color: colors.mutedForeground }]}>
+            {hintText}
+          </Text>
+        </View>
+
+        {/* ── ACTIVAR MODO BOLSILLO button ──────────────────────────────────
+            REGLA 1: Botón grande y visible en la pantalla principal normal.
+            Fondo rojo (#dc2626), texto blanco, tamaño generoso.
+            Al presionarlo activa el overlay negro inmediatamente.
+        ──────────────────────────────────────────────────────────────────── */}
+        {Platform.OS !== "web" && (
+          <Pressable
+            style={({ pressed }) => [
+              styles.pocketBtn,
+              pressed && styles.pocketBtnPressed,
+            ]}
+            onPress={activatePocketMode}
+            testID="pocket-mode-button"
+          >
+            <Feather name="moon" size={20} color="#fff" />
+            <Text style={styles.pocketBtnText}>ACTIVAR MODO BOLSILLO</Text>
+          </Pressable>
+        )}
+
+        {Platform.OS !== "web" && (
+          <View style={styles.debugBar}>
+            <Text style={styles.debugText}>{debugInfo}</Text>
           </View>
         )}
       </View>
 
-      <View style={styles.orbArea}>
-        <Text style={[styles.statusLabel, { color: colors.mutedForeground }]}>
-          {statusLabel}
-        </Text>
+      {/* ══════════════════════════════════════════════════════════════════════
+          REGLA 2 — OSCURIDAD ABSOLUTA
+          position:'absolute' con top/bottom/left/right=0 cubre el FULL screen
+          porque el root View ya se extiende bajo la status bar (translucent).
+          zIndex:9999 garantiza que queda por encima de TODO el UI.
+          backgroundColor:'#000000' = píxeles AMOLED completamente apagados.
+          NO hay NI UN SOLO elemento visible dentro — cero texto, cero íconos.
 
+          REGLA 3 — DOS SALIDAS
+          A) Botón físico de volumen → exitPocketMode() (listener arriba).
+          B) onLongPress con delayLongPress={3000} → 3 segundos de presión
+             continua para salir. Los toques rápidos son ignorados (sin onPress).
+      ══════════════════════════════════════════════════════════════════════ */}
+      {amoledActive && Platform.OS !== "web" && (
         <Pressable
-          onPress={handleOrbPress}
-          style={({ pressed }) => [
-            styles.orbWrapper,
-            pressed && styles.orbPressed,
-          ]}
-          testID="voice-orb"
-        >
-          <VoiceOrb status={isSessionActive ? status : "idle"} size={100} />
-        </Pressable>
-
-        <Text style={[styles.hintText, { color: colors.mutedForeground }]}>
-          {hintText}
-        </Text>
-      </View>
-
-      {Platform.OS !== "web" && (
-        <View style={styles.debugBar}>
-          <Text style={styles.debugText}>{debugInfo}</Text>
-        </View>
+          style={styles.amoledOverlay}
+          onLongPress={exitPocketMode}
+          delayLongPress={3000}
+          android_disableSound
+        />
       )}
-
-      {/* ── AMOLED "Modo Bolsillo" overlay ──────────────────────────────────
-          A React Native Modal with statusBarTranslucent={true} draws from
-          pixel (0,0) of the physical screen, overriding both the status bar
-          area and the safe area insets — nothing is clipped.
-          backgroundColor: '#000000' = AMOLED pixels off = ~0 W.
-          NO text, NO icons, NO status indicators inside: any lit pixel costs
-          battery. Pure black silence.
-          The navigation bar is hidden separately via expo-navigation-bar
-          (see useEffect above).  It's restored when the overlay dismisses.
-          Tap anywhere (or press a volume key) to exit.
-      ─────────────────────────────────────────────────────────────────────── */}
-      <Modal
-        visible={amoledActive && Platform.OS !== "web"}
-        transparent
-        statusBarTranslucent
-        animationType="none"
-        onRequestClose={resetInactivityTimer}
-      >
-        {/* StatusBar hidden=true removes the top status bar icons + background. */}
-        <StatusBar hidden translucent backgroundColor="transparent" />
-        <TouchableWithoutFeedback onPress={resetInactivityTimer}>
-          {/* flex:1 fills the entire Modal viewport = full physical screen */}
-          <View style={styles.amoledOverlay} />
-        </TouchableWithoutFeedback>
-      </Modal>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
+  // Root fills full physical screen (translucent status bar in app.json).
+  root: {
+    flex: 1,
+  },
+  // Inner container carries safe-area padding so UI content is never clipped.
   container: { flex: 1 },
   header: {
     flexDirection: "row",
@@ -344,6 +371,28 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_400Regular",
     height: 18,
   },
+  // ── ACTIVAR MODO BOLSILLO button ──────────────────────────────────────────
+  pocketBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    marginHorizontal: 20,
+    marginBottom: 12,
+    paddingVertical: 16,
+    borderRadius: 14,
+    backgroundColor: "#dc2626",
+  },
+  pocketBtnPressed: {
+    backgroundColor: "#b91c1c",
+    transform: [{ scale: 0.97 }],
+  },
+  pocketBtnText: {
+    color: "#ffffff",
+    fontSize: 17,
+    fontFamily: "Inter_700Bold",
+    letterSpacing: 0.5,
+  },
   debugBar: {
     backgroundColor: "rgba(0,0,0,0.7)",
     paddingHorizontal: 12,
@@ -355,13 +404,16 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_400Regular",
     textAlign: "center",
   },
-  // ── AMOLED overlay style ───────────────────────────────────────────────────
-  // flex:1 fills the entire Modal viewport (= full physical screen because
-  // the Modal uses statusBarTranslucent and draws edge-to-edge).
-  // backgroundColor '#000000' = AMOLED pixels completely off.
-  // No content, no text, no indicators: absolute darkness.
+  // ── AMOLED OVERLAY — REGLA 2 ─────────────────────────────────────────────
+  // position:'absolute' + 0,0,0,0 + zIndex:9999 = cubre TODO, incluyendo
+  // la status bar (root View es translucent).  #000000 = cero emisión AMOLED.
   amoledOverlay: {
-    flex: 1,
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 9999,
     backgroundColor: "#000000",
   },
 });
